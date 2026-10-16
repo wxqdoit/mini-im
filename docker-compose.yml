@@ -88,6 +88,17 @@ services:
     volumes:
       - minio_data:/data
 
+  jaeger:
+    image: jaegertracing/all-in-one:1.57
+    container_name: mini_im_jaeger
+    restart: always
+    environment:
+      - COLLECTOR_OTLP_ENABLED=true
+    ports:
+      - "16686:16686"
+      - "4317:4317"
+      - "4318:4318"
+
   # ==========================================
   # Frontend SPA Container (React + Vite + Nginx)
   # ==========================================
@@ -124,6 +135,8 @@ services:
       KAFKA_BOOTSTRAP_SERVERS: "kafka:29092"
       MINIO_ENDPOINT: "minio:9000"
       MINIO_PUBLIC_URL: "http://127.0.0.1:9000"
+      OTEL_EXPORTER_OTLP_ENDPOINT: "http://jaeger:4318/v1/traces"
+      PUSH_NOTIFICATION_PROVIDER: "mock"
     ports:
       - "5001:5001"
     depends_on:
@@ -154,6 +167,8 @@ services:
       KAFKA_BOOTSTRAP_SERVERS: "kafka:29092"
       MINIO_ENDPOINT: "minio:9000"
       MINIO_PUBLIC_URL: "http://127.0.0.1:9000"
+      OTEL_EXPORTER_OTLP_ENDPOINT: "http://jaeger:4318/v1/traces"
+      PUSH_NOTIFICATION_PROVIDER: "mock"
     ports:
       - "5002:5002"
     depends_on:
@@ -184,6 +199,8 @@ services:
       KAFKA_BOOTSTRAP_SERVERS: "kafka:29092"
       MINIO_ENDPOINT: "minio:9000"
       MINIO_PUBLIC_URL: "http://127.0.0.1:9000"
+      OTEL_EXPORTER_OTLP_ENDPOINT: "http://jaeger:4318/v1/traces"
+      PUSH_NOTIFICATION_PROVIDER: "mock"
     ports:
       - "5003:5003"
     depends_on:
@@ -213,6 +230,8 @@ services:
       KAFKA_CONSUMER_GROUP: "mini_im_cluster_worker_group"
       KAFKA_BATCH_SIZE: 200
       KAFKA_BATCH_TIMEOUT_MS: 50
+      OTEL_EXPORTER_OTLP_ENDPOINT: "http://jaeger:4318/v1/traces"
+      PUSH_NOTIFICATION_PROVIDER: "mock"
     depends_on:
       postgres:
         condition: service_healthy

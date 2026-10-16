@@ -58,3 +58,14 @@ class Config:
     # Kafka Micro-batch Persistence Tuning (100k Concurrent)
     KAFKA_BATCH_SIZE = int(os.getenv("KAFKA_BATCH_SIZE", "200"))
     KAFKA_BATCH_TIMEOUT_MS = int(os.getenv("KAFKA_BATCH_TIMEOUT_MS", "50"))
+
+    # Distributed Tracing (OpenTelemetry)
+    OTEL_ENABLED = os.getenv("OTEL_ENABLED", "true").lower() == "true"
+    OTEL_EXPORTER_OTLP_ENDPOINT = os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://127.0.0.1:4318/v1/traces")
+
+    # Offline Push Notifications (APNs / FCM / Mock)
+    PUSH_NOTIFICATION_PROVIDER = os.getenv("PUSH_NOTIFICATION_PROVIDER", "mock").lower()
+
+    # WebRTC Audio/Video Calling
+    WEBRTC_CALL_TIMEOUT_SECONDS = int(os.getenv("WEBRTC_CALL_TIMEOUT_SECONDS", "45"))
+    STUN_SERVERS = os.getenv("STUN_SERVERS", "stun:stun.l.google.com:19302,stun:stun1.l.google.com:19302")

@@ -8,11 +8,13 @@ from flask_sock import Sock
 from auth import decode_token
 from config import Config
 from db import get_db
+import time
 from redis_client import (
     get_redis_client, set_user_online, set_user_offline,
     refresh_user_heartbeat, publish_event, get_user_status,
     get_cached_group_members, cache_group_members,
-    register_user_gateway, refresh_user_gateway, unregister_user_gateway
+    register_user_gateway, refresh_user_gateway, unregister_user_gateway,
+    get_user_gateway, publish_to_gateways_for_users
 )
 from kafka_service import send_to_kafka
 from rate_limiter import check_rate_limit
@@ -415,6 +417,122 @@ def handle_websocket(ws):
                         f"{conv_type}:{recipient_id}",
                         kafka_payload
                     )
+                continue
+
+            # 5. WebRTC Audio/Video Call Signaling Engine
+            if msg_type == "call_invite":
+                target_id = int(msg_data.get("recipient_id") or msg_data.get("target_id") or 0)
+                call_id = msg_data.get("call_id")
+                call_type = msg_data.get("call_type", "video")
+                if target_id and call_id:
+                    target_gw = get_user_gateway(target_id)
+                    if not target_gw:
+                        try:
+                            ws.send(json.dumps({
+                                "event": "call_failed",
+                                "data": {"call_id": call_id, "recipient_id": target_id, "reason": "User is currently offline"}
+                            }))
+                        except Exception:
+                            pass
+                    else:
+                        r = get_redis_client()
+                        call_info = {
+                            "call_id": call_id,
+                            "caller_id": user_id,
+                            "recipient_id": target_id,
+                            "call_type": call_type,
+                            "status": "ringing",
+                            "created_at": time.time()
+                        }
+                        r.set(f"mini_im:call:{call_id}", json.dumps(call_info), ex=60)
+                        caller_info = {
+                            "id": user.get("id"),
+                            "username": user.get("username"),
+                            "nickname": user.get("nickname"),
+                            "avatar": user.get("avatar")
+                        }
+                        publish_to_gateways_for_users([target_id], {
+                            "event": "call_invite",
+                            "data": {
+                                "call_id": call_id,
+                                "caller_id": user_id,
+                                "caller": caller_info,
+                                "recipient_id": target_id,
+                                "call_type": call_type
+                            }
+                        })
+                continue
+
+            if msg_type == "call_ringing":
+                caller_id = int(msg_data.get("caller_id") or 0)
+                call_id = msg_data.get("call_id")
+                if caller_id and call_id:
+                    publish_to_gateways_for_users([caller_id], {
+                        "event": "call_ringing",
+                        "data": {"call_id": call_id, "recipient_id": user_id}
+                    })
+                continue
+
+            if msg_type == "call_accept":
+                caller_id = int(msg_data.get("caller_id") or 0)
+                call_id = msg_data.get("call_id")
+                if caller_id and call_id:
+                    r = get_redis_client()
+                    call_key = f"mini_im:call:{call_id}"
+                    raw_call = r.get(call_key)
+                    if raw_call:
+                        try:
+                            call_record = json.loads(raw_call)
+                            call_record["status"] = "connected"
+                            r.set(call_key, json.dumps(call_record), ex=3600)
+                        except Exception:
+                            pass
+                    publish_to_gateways_for_users([caller_id], {
+                        "event": "call_accept",
+                        "data": {"call_id": call_id, "recipient_id": user_id}
+                    })
+                continue
+
+            if msg_type == "call_reject":
+                caller_id = int(msg_data.get("caller_id") or 0)
+                call_id = msg_data.get("call_id")
+                reason = msg_data.get("reason", "declined")
+                if caller_id and call_id:
+                    r = get_redis_client()
+                    r.delete(f"mini_im:call:{call_id}")
+                    publish_to_gateways_for_users([caller_id], {
+                        "event": "call_reject",
+                        "data": {"call_id": call_id, "recipient_id": user_id, "reason": reason}
+                    })
+                continue
+
+            if msg_type == "call_hangup":
+                target_id = int(msg_data.get("target_id") or msg_data.get("recipient_id") or msg_data.get("caller_id") or 0)
+                call_id = msg_data.get("call_id")
+                if call_id:
+                    r = get_redis_client()
+                    r.delete(f"mini_im:call:{call_id}")
+                if target_id and call_id:
+                    publish_to_gateways_for_users([target_id], {
+                        "event": "call_hangup",
+                        "data": {"call_id": call_id, "sender_id": user_id}
+                    })
+                continue
+
+            if msg_type in ["webrtc_offer", "webrtc_answer", "webrtc_ice_candidate"]:
+                target_id = int(msg_data.get("target_id") or msg_data.get("recipient_id") or 0)
+                call_id = msg_data.get("call_id")
+                if target_id and call_id:
+                    publish_to_gateways_for_users([target_id], {
+                        "event": msg_type,
+                        "data": {
+                            "call_id": call_id,
+                            "sender_id": user_id,
+                            "sdp": msg_data.get("sdp"),
+                            "candidate": msg_data.get("candidate")
+                        }
+                    })
+                continue
 
     except Exception as e:
         print(f"WebSocket closed/error for user {user_id} on [{NODE_ID}]: {e}")

@@ -90,3 +90,17 @@ export interface Conversation {
   last_time?: string | null
   unread_count: number
 }
+
+export interface CallSession {
+  call_id: string
+  target_id: number
+  target_user?: {
+    id: number
+    username?: string
+    nickname?: string
+    avatar?: string
+  }
+  call_type: 'audio' | 'video'
+  direction: 'incoming' | 'outgoing'
+  status: 'calling' | 'ringing' | 'connected' | 'ended'
+}

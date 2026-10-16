@@ -3,6 +3,9 @@ import { User, Friend, FriendRequest, Group, Message, Conversation } from '../ty
 import { friendApi, groupApi, messageApi, uploadApi } from '../api/client'
 import { useAuth } from './AuthContext'
 import { playNotificationSound } from '../lib/utils'
+import { CallSession } from "../types"
+import { WebRTCManager } from "../lib/webrtc"
+import { CallModal } from "../components/modals/CallModal"
 import {
   initUserE2EE,
   encryptDirectMessage,
@@ -36,6 +39,7 @@ interface ChatContextType {
   refreshGroups: () => Promise<void>
   refreshFriendRequests: () => Promise<void>
   selectConversationByTarget: (type: 'direct' | 'group', targetId: number) => Promise<void>
+  startCall: (callType: 'audio' | 'video', target: { id: number; name?: string; username?: string; avatar?: string }) => Promise<void>
 }
 
 const ChatContext = createContext<ChatContextType | undefined>(undefined)
@@ -53,6 +57,130 @@ export const ChatProvider: React.FC<{ children: React.ReactNode }> = ({ children
   })
   const [groups, setGroups] = useState<Group[]>([])
   const [wsStatus, setWsStatus] = useState<'connecting' | 'connected' | 'disconnected'>('disconnected')
+  const [activeCall, setActiveCall] = useState<CallSession | null>(null)
+  const [localStream, setLocalStream] = useState<MediaStream | null>(null)
+  const [remoteStream, setRemoteStream] = useState<MediaStream | null>(null)
+  const webrtcManagerRef = useRef<WebRTCManager>(new WebRTCManager())
+  const activeCallRef = useRef<CallSession | null>(null)
+
+  useEffect(() => {
+    activeCallRef.current = activeCall
+  }, [activeCall])
+
+  const sendSignaling = useCallback((type: string, data: any) => {
+    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+      wsRef.current.send(JSON.stringify({ type, ...data }))
+    }
+  }, [])
+
+  useEffect(() => {
+    const mgr = webrtcManagerRef.current
+    mgr.setSignalingSender(sendSignaling)
+    mgr.onLocalStream = (stream) => setLocalStream(stream)
+    mgr.onRemoteStream = (stream) => setRemoteStream(stream)
+    mgr.onCallEnded = () => {
+      mgr.cleanup()
+      setActiveCall(null)
+      setLocalStream(null)
+      setRemoteStream(null)
+    }
+  }, [sendSignaling])
+
+  const startCall = useCallback(async (callType: 'audio' | 'video', target: { id: number; name?: string; username?: string; avatar?: string }) => {
+    const callId = `call_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`
+    const session: CallSession = {
+      call_id: callId,
+      target_id: target.id,
+      target_user: { id: target.id, nickname: target.name || target.username || "对方", avatar: target.avatar },
+      call_type: callType,
+      direction: "outgoing",
+      status: "calling",
+    }
+    activeCallRef.current = session
+    setActiveCall(session)
+    try {
+      await webrtcManagerRef.current.getLocalMedia(callType, userRef.current?.nickname || userRef.current?.username || "我")
+      webrtcManagerRef.current.initPeerConnection(callId, target.id)
+      sendSignaling("call_invite", {
+        call_id: callId,
+        recipient_id: target.id,
+        call_type: callType,
+      })
+    } catch (err) {
+      console.error("[WebRTC] Failed to start call:", err)
+      alert("无法访问摄像头或麦克风设备，请检查浏览器权限")
+      webrtcManagerRef.current.cleanup()
+      setActiveCall(null)
+      setLocalStream(null)
+      setRemoteStream(null)
+    }
+  }, [sendSignaling])
+
+  const acceptCall = useCallback(async () => {
+    const call = activeCallRef.current
+    if (!call) return
+    const connectedSession: CallSession = { ...call, status: "connected" }
+    activeCallRef.current = connectedSession
+    setActiveCall(connectedSession)
+    try {
+      await webrtcManagerRef.current.getLocalMedia(call.call_type, userRef.current?.nickname || userRef.current?.username || "我")
+      webrtcManagerRef.current.initPeerConnection(call.call_id, call.target_id)
+      sendSignaling("call_accept", {
+        call_id: call.call_id,
+        caller_id: call.target_id,
+      })
+    } catch (err) {
+      console.error("[WebRTC] Failed to accept call:", err)
+      alert("无法访问媒体设备")
+      webrtcManagerRef.current.cleanup()
+      setActiveCall(null)
+      setLocalStream(null)
+      setRemoteStream(null)
+    }
+  }, [sendSignaling])
+
+  const rejectCall = useCallback(() => {
+    const call = activeCallRef.current
+    if (call) {
+      sendSignaling("call_reject", {
+        call_id: call.call_id,
+        caller_id: call.target_id,
+        reason: "declined",
+      })
+    }
+    webrtcManagerRef.current.cleanup()
+    activeCallRef.current = null
+    setActiveCall(null)
+    setLocalStream(null)
+    setRemoteStream(null)
+  }, [sendSignaling])
+
+  const hangupCall = useCallback(() => {
+    const call = activeCallRef.current
+    if (call) {
+      sendSignaling("call_hangup", {
+        call_id: call.call_id,
+        target_id: call.target_id,
+      })
+    }
+    webrtcManagerRef.current.cleanup()
+    activeCallRef.current = null
+    setActiveCall(null)
+    setLocalStream(null)
+    setRemoteStream(null)
+  }, [sendSignaling])
+
+  const toggleMic = useCallback(() => {
+    return webrtcManagerRef.current.toggleAudio()
+  }, [])
+
+  const toggleCam = useCallback(() => {
+    return webrtcManagerRef.current.toggleVideo()
+  }, [])
+
+  const retryRealCamera = useCallback(async () => {
+    return await webrtcManagerRef.current.upgradeToRealCamera()
+  }, [])
 
   // Refs to avoid stale closures in event handlers and timers
   const activeConversationRef = useRef<Conversation | null>(activeConversation)
@@ -466,6 +594,79 @@ export const ChatProvider: React.FC<{ children: React.ReactNode }> = ({ children
       refreshGroups()
       if (eventName === 'group_disbanded' && currentActive?.target_id === data.group_id) {
         setConversationWithRef(null)
+      }
+    } else if (eventName === 'call_invite') {
+      playNotificationSound()
+      const incomingSession: CallSession = {
+        call_id: data.call_id,
+        target_id: data.caller_id,
+        target_user: data.caller,
+        call_type: data.call_type || "video",
+        direction: "incoming",
+        status: "ringing",
+      }
+      activeCallRef.current = incomingSession
+      setActiveCall(incomingSession)
+      sendSignaling("call_ringing", { call_id: data.call_id, caller_id: data.caller_id })
+    } else if (eventName === 'call_ringing') {
+      if (activeCallRef.current?.call_id === data.call_id) {
+        activeCallRef.current = { ...activeCallRef.current, status: "ringing" }
+        setActiveCall(prev => prev ? { ...prev, status: "ringing" } : null)
+      }
+    } else if (eventName === 'call_accept') {
+      if (activeCallRef.current?.call_id === data.call_id) {
+        activeCallRef.current = { ...activeCallRef.current, status: "connected" }
+        setActiveCall(prev => prev ? { ...prev, status: "connected" } : null)
+        const peerTargetId = data.recipient_id || activeCallRef.current?.target_id
+        webrtcManagerRef.current.createOffer().then(offer => {
+          sendSignaling("webrtc_offer", {
+            call_id: data.call_id,
+            target_id: peerTargetId,
+            sdp: offer,
+          })
+        }).catch(err => console.error("[WebRTC] Error creating offer:", err))
+      }
+    } else if (eventName === 'call_reject') {
+      alert(`对方已拒绝通话 (${data.reason || "已拒绝"})`)
+      webrtcManagerRef.current.cleanup()
+      activeCallRef.current = null
+      setActiveCall(null)
+      setLocalStream(null)
+      setRemoteStream(null)
+    } else if (eventName === 'call_hangup') {
+      webrtcManagerRef.current.cleanup()
+      activeCallRef.current = null
+      setActiveCall(null)
+      setLocalStream(null)
+      setRemoteStream(null)
+    } else if (eventName === 'call_failed') {
+      alert(`通话失败: ${data.reason || "对方当前不在线"}`)
+      webrtcManagerRef.current.cleanup()
+      activeCallRef.current = null
+      setActiveCall(null)
+      setLocalStream(null)
+      setRemoteStream(null)
+    } else if (eventName === 'webrtc_offer') {
+      if (activeCallRef.current?.call_id === data.call_id) {
+        webrtcManagerRef.current.handleOffer(data.sdp).then(answer => {
+          sendSignaling("webrtc_answer", {
+            call_id: data.call_id,
+            target_id: data.sender_id,
+            sdp: answer,
+          })
+        }).catch(err => console.error("[WebRTC] Error handling offer:", err))
+      }
+    } else if (eventName === 'webrtc_answer') {
+      if (activeCallRef.current?.call_id === data.call_id) {
+        webrtcManagerRef.current.handleAnswer(data.sdp).catch(err =>
+          console.error("[WebRTC] Error handling answer:", err)
+        )
+      }
+    } else if (eventName === 'webrtc_ice_candidate') {
+      if (activeCallRef.current?.call_id === data.call_id && data.candidate) {
+        webrtcManagerRef.current.addIceCandidate(data.candidate).catch(err =>
+          console.error("[WebRTC] Error adding ICE candidate:", err)
+        )
       }
     }
   }
@@ -887,9 +1088,23 @@ export const ChatProvider: React.FC<{ children: React.ReactNode }> = ({ children
         refreshGroups,
         refreshFriendRequests,
         selectConversationByTarget,
+        startCall,
       }}
     >
       {children}
+      {activeCall && (
+        <CallModal
+          call={activeCall}
+          localStream={localStream}
+          remoteStream={remoteStream}
+          onAccept={acceptCall}
+          onReject={rejectCall}
+          onHangup={hangupCall}
+          onToggleMic={toggleMic}
+          onToggleCam={toggleCam}
+          onRetryRealCamera={retryRealCamera}
+        />
+      )}
     </ChatContext.Provider>
   )
 }

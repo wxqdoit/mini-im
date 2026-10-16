@@ -39,7 +39,9 @@ def rate_limit(key_prefix: str, limit: int, window_seconds: int, by_user: bool =
             if by_user and hasattr(g, "current_user") and g.current_user:
                 identifier = f"user:{g.current_user['id']}"
             else:
-                identifier = f"ip:{request.remote_addr or 'unknown'}"
+                forwarded = request.headers.get("X-Forwarded-For")
+                client_ip = forwarded.split(",")[0].strip() if forwarded else (request.headers.get("X-Real-IP") or request.remote_addr or "unknown")
+                identifier = f"ip:{client_ip}"
 
             redis_key = f"mini_im:ratelimit:{key_prefix}:{identifier}"
             allowed = check_rate_limit(redis_key, limit, window_seconds)

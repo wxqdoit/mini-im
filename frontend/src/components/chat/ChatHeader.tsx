@@ -2,13 +2,13 @@ import React, { useState } from 'react'
 import { useChat } from '@/context/ChatContext'
 import { Avatar, AvatarImage, AvatarFallback } from '@/components/ui/avatar'
 import { Button } from '@/components/ui/button'
-import { Users, MoreVertical, Trash2, UserX, ShieldCheck } from 'lucide-react'
+import { Users, MoreVertical, Trash2, UserX, ShieldCheck, Phone, Video } from 'lucide-react'
 import { E2EEVerificationModal } from '../modals/E2EEVerificationModal'
 import { GroupDetailModal } from '../modals/GroupDetailModal'
 import { friendApi } from '@/api/client'
 
 export const ChatHeader: React.FC = () => {
-  const { activeConversation, refreshFriends, refreshConversations, setActiveConversation } = useChat()
+  const { activeConversation, refreshFriends, refreshConversations, setActiveConversation, startCall } = useChat()
   const [showGroupModal, setShowGroupModal] = useState(false)
   const [showE2eeModal, setShowE2eeModal] = useState(false)
   const [showMenu, setShowMenu] = useState(false)
@@ -77,6 +77,29 @@ export const ChatHeader: React.FC = () => {
           <ShieldCheck className="w-3.5 h-3.5 text-emerald-600" />
           <span>E2EE 已保护</span>
         </button>
+
+        {!isGroup && (
+          <div className="flex items-center gap-0.5">
+            <Button
+              variant="ghost"
+              size="icon"
+              onClick={() => startCall('audio', { id: activeConversation.target_id, name: activeConversation.name, avatar: activeConversation.avatar })}
+              className="text-slate-500 hover:text-indigo-600 rounded-xl"
+              title="语音通话"
+            >
+              <Phone className="w-4 h-4" />
+            </Button>
+            <Button
+              variant="ghost"
+              size="icon"
+              onClick={() => startCall('video', { id: activeConversation.target_id, name: activeConversation.name, avatar: activeConversation.avatar })}
+              className="text-slate-500 hover:text-indigo-600 rounded-xl"
+              title="视频通话"
+            >
+              <Video className="w-4 h-4" />
+            </Button>
+          </div>
+        )}
         {isGroup ? (
           <Button
             variant="ghost"

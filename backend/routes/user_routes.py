@@ -102,3 +102,60 @@ def search_users():
         u["status"] = p["status"]
 
     return jsonify({"users": users})
+
+@user_bp.route("/device-token", methods=["POST"])
+@token_required
+def register_device_token():
+    user_id = g.current_user["id"]
+    data = request.get_json() or {}
+    platform = data.get("platform", "web").strip().lower()
+    device_token = data.get("device_token", "").strip()
+
+    if not device_token:
+        return jsonify({"error": "device_token is required"}), 400
+
+    if platform not in ["ios", "android", "web"]:
+        platform = "web"
+
+    with get_db() as cur:
+        cur.execute("""
+            INSERT INTO user_devices (user_id, platform, device_token, is_active, updated_at)
+            VALUES (%s, %s, %s, TRUE, CURRENT_TIMESTAMP)
+            ON CONFLICT (user_id, device_token)
+            DO UPDATE SET 
+                is_active = TRUE,
+                platform = EXCLUDED.platform,
+                updated_at = CURRENT_TIMESTAMP;
+        """, (user_id, platform, device_token))
+
+    return jsonify({"message": "Device token registered successfully", "platform": platform})
+
+@user_bp.route("/device-token", methods=["DELETE"])
+@token_required
+def unregister_device_token():
+    user_id = g.current_user["id"]
+    data = request.get_json() or {}
+    device_token = data.get("device_token")
+
+    with get_db() as cur:
+        if device_token:
+            cur.execute("""
+                UPDATE user_devices SET is_active = FALSE, updated_at = CURRENT_TIMESTAMP
+                WHERE user_id = %s AND device_token = %s;
+            """, (user_id, device_token))
+        else:
+            cur.execute("""
+                UPDATE user_devices SET is_active = FALSE, updated_at = CURRENT_TIMESTAMP
+                WHERE user_id = %s;
+            """, (user_id,))
+
+    return jsonify({"message": "Device token(s) deactivated successfully"})
+
+@user_bp.route("/push-notifications", methods=["GET"])
+@token_required
+def get_my_push_notifications():
+    from push_service import get_user_push_logs
+    user_id = g.current_user["id"]
+    limit = int(request.args.get("limit", 20))
+    logs = get_user_push_logs(user_id=user_id, limit=limit)
+    return jsonify({"notifications": logs})

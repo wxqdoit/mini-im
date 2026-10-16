@@ -10,12 +10,26 @@ const api = axios.create({
   },
 })
 
-// Request interceptor to attach JWT token
+// Helper to generate 32-hex trace ID and 16-hex span ID (W3C standard)
+function generateHex(len: number): string {
+  const chars = '0123456789abcdef'
+  let res = ''
+  for (let i = 0; i < len; i++) {
+    res += chars[Math.floor(Math.random() * 16)]
+  }
+  return res
+}
+
+// Request interceptor to attach JWT token and W3C Distributed Trace headers
 api.interceptors.request.use((config) => {
   const token = localStorage.getItem('mini_im_token')
   if (token && !config.headers.Authorization) {
     config.headers.Authorization = `Bearer ${token}`
   }
+  const traceId = generateHex(32)
+  const spanId = generateHex(16)
+  config.headers['traceparent'] = `00-${traceId}-${spanId}-01`
+  config.headers['X-Trace-Id'] = traceId
   return config
 })
 
@@ -50,6 +64,15 @@ export const userApi = {
   
   searchUsers: (query: string) =>
     api.get<{ users: (User & { is_friend: boolean; request_sent: boolean })[] }>(`/users/search?q=${encodeURIComponent(query)}`),
+
+  registerDeviceToken: (platform: string, device_token: string) =>
+    api.post<{ message: string }>('/users/device-token', { platform, device_token }),
+
+  unregisterDeviceToken: (device_token?: string) =>
+    api.delete<{ message: string }>('/users/device-token', { data: { device_token } }),
+
+  getPushNotifications: (limit = 20) =>
+    api.get<{ notifications: any[] }>(`/users/push-notifications?limit=${limit}`),
 }
 
 export const friendApi = {

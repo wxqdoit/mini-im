@@ -19,6 +19,7 @@ from redis_client import reset_all_online_presence
 from minio_service import init_minio_bucket
 from kafka_service import start_kafka_consumer
 from websocket_server import register_websocket
+from telemetry import init_telemetry, get_current_trace_id
 
 from routes.auth_routes import auth_bp
 from routes.user_routes import user_bp
@@ -34,6 +35,12 @@ def create_app(role: str = None):
 
     role = (role or Config.SERVICE_ROLE or "all").lower()
     app.config["SERVICE_ROLE"] = role
+    init_telemetry(f"mini-im-{role}")
+    try:
+        from opentelemetry.instrumentation.flask import FlaskInstrumentor
+        FlaskInstrumentor().instrument_app(app)
+    except Exception:
+        pass
 
     # Enable CORS for API routes
     CORS(app, resources={r"/api/*": {"origins": "*"}}, supports_credentials=True)
@@ -82,6 +89,14 @@ def create_app(role: str = None):
                 "minio": "ok"
             }
         })
+
+    @app.after_request
+    def set_trace_header(response):
+        try:
+            response.headers["X-Trace-Id"] = get_current_trace_id()
+        except Exception:
+            pass
+        return response
 
     return app
 

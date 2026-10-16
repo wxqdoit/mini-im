@@ -209,7 +209,8 @@ ALTER TABLE messages ADD COLUMN IF NOT EXISTS is_encrypted BOOLEAN DEFAULT FALSE
     with get_db() as cur:
         cur.execute(create_schema_sql)
     ensure_monthly_partitions()
-    print("Database tables, partitions & indexes initialized successfully!")
+    init_user_devices_table()
+    print("Database tables, partitions, indexes & user_devices initialized successfully!")
 
 
 def bulk_insert_messages(messages_list):
@@ -273,3 +274,23 @@ def bulk_insert_messages(messages_list):
             m_dict["sender"] = sender_map.get(m_dict["sender_id"])
             result.append(m_dict)
         return result
+
+def init_user_devices_table():
+    sql = """
+    CREATE TABLE IF NOT EXISTS user_devices (
+        id SERIAL PRIMARY KEY,
+        user_id INT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        platform VARCHAR(20) NOT NULL,
+        device_token VARCHAR(255) NOT NULL,
+        is_active BOOLEAN DEFAULT TRUE,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        CONSTRAINT uq_user_device UNIQUE (user_id, device_token)
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_user_devices_user 
+    ON user_devices(user_id) 
+    WHERE is_active = TRUE;
+    """
+    with get_db() as cur:
+        cur.execute(sql)

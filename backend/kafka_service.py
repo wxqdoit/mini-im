@@ -50,6 +50,13 @@ def send_to_kafka(topic, key, data):
     Automatically assigns monotonic 64-bit sequence ID (SeqID) to guarantee total order.
     """
     try:
+        # OpenTelemetry Trace Context Propagation
+        try:
+            from telemetry import inject_trace_context
+            inject_trace_context(data)
+        except Exception:
+            pass
+
         # Assign monotonic sequence ID if not already present
         if not data.get("seq_id"):
             conv_type = data.get("conversation_type")
@@ -166,32 +173,63 @@ def _get_group_members_cached(group_id: int) -> set:
 def _process_kafka_batch(messages_batch: list):
     """
     Consumes a micro-batch of chat messages, saves them into PostgreSQL via bulk_insert_messages,
-    and dispatches them using Precision Gateway Routing.
+    dispatches them using Precision Gateway Routing, and triggers offline push for offline users.
+    Instrumented with OpenTelemetry Spans.
     """
     if not messages_batch:
         return
 
-    # 1. Bulk insert all messages in one DB round trip
-    persisted_messages = bulk_insert_messages(messages_batch)
+    from telemetry import trace_span
+    from push_service import dispatch_offline_notification
+    from redis_client import get_user_gateway, batch_get_user_gateways
 
-    # 2. Dispatch events with Precision Routing
-    for saved_msg in persisted_messages:
-        conv_type = saved_msg.get("conversation_type")
-        sender_id = saved_msg.get("sender_id")
-        recipient_id = saved_msg.get("recipient_id")
-        
-        event_payload = {
-            "event": "new_message",
-            "data": saved_msg
-        }
+    with trace_span("kafka.consume_batch", {"batch.size": len(messages_batch)}):
+        # 1. Bulk insert all messages in one DB round trip
+        with trace_span("db.bulk_insert_messages", {"count": len(messages_batch)}):
+            persisted_messages = bulk_insert_messages(messages_batch)
 
-        if conv_type == "direct":
-            # Precision routing directly to sender & recipient active gateway nodes
-            publish_to_gateways_for_users([recipient_id, sender_id], event_payload)
-        elif conv_type == "group":
-            member_ids = _get_group_members_cached(recipient_id)
-            if member_ids:
-                publish_to_gateways_for_users(list(member_ids), event_payload)
+        # 2. Dispatch events with Precision Routing & Offline Push Detection
+        for saved_msg in persisted_messages:
+            conv_type = saved_msg.get("conversation_type")
+            sender_id = saved_msg.get("sender_id")
+            recipient_id = saved_msg.get("recipient_id")
+            
+            event_payload = {
+                "event": "new_message",
+                "data": saved_msg
+            }
+
+            if conv_type == "direct":
+                # Precision routing directly to sender & recipient active gateway nodes
+                with trace_span("gateway.precision_route", {"conv_type": "direct"}):
+                    publish_to_gateways_for_users([recipient_id, sender_id], event_payload)
+
+                # Offline Push Check: if recipient is not connected to any gateway node
+                try:
+                    gw_node = get_user_gateway(recipient_id)
+                    if not gw_node:
+                        with trace_span("push.dispatch_offline", {"user_id": recipient_id}):
+                            dispatch_offline_notification(recipient_id, saved_msg)
+                except Exception as ex:
+                    print(f"[OfflinePush] Direct push dispatch error: {ex}")
+
+            elif conv_type == "group":
+                member_ids = _get_group_members_cached(recipient_id)
+                if member_ids:
+                    with trace_span("gateway.precision_route", {"conv_type": "group", "members_count": len(member_ids)}):
+                        publish_to_gateways_for_users(list(member_ids), event_payload)
+
+                    # Offline Push Check: find offline members in the group
+                    try:
+                        gateways_map = batch_get_user_gateways(list(member_ids))
+                        offline_members = [
+                            uid for uid in member_ids 
+                            if uid != sender_id and not gateways_map.get(uid)
+                        ]
+                        for off_uid in offline_members:
+                            dispatch_offline_notification(off_uid, saved_msg)
+                    except Exception as ex:
+                        print(f"[OfflinePush] Group push dispatch error: {ex}")
 
 def _process_kafka_message(single_data: dict):
     _process_kafka_batch([single_data])

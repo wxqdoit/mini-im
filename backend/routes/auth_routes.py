@@ -7,7 +7,7 @@ from rate_limiter import rate_limit
 auth_bp = Blueprint("auth", __name__, url_prefix="/api/auth")
 
 @auth_bp.route("/register", methods=["POST"])
-@rate_limit("register", limit=10, window_seconds=60)
+@rate_limit("register", limit=100, window_seconds=60)
 def register():
     data = request.get_json() or {}
     username = data.get("username", "").strip()
@@ -47,7 +47,7 @@ def register():
     }), 201
 
 @auth_bp.route("/login", methods=["POST"])
-@rate_limit("login", limit=15, window_seconds=60)
+@rate_limit("login", limit=100, window_seconds=60)
 def login():
     data = request.get_json() or {}
     username = data.get("username", "").strip()

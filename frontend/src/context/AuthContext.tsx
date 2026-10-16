@@ -38,6 +38,18 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
     }
   }, [token])
 
+  // Automatically register device token for offline notifications
+  useEffect(() => {
+    if (user?.id && token) {
+      let devToken = localStorage.getItem("mini_im_device_token")
+      if (!devToken) {
+        devToken = `web_${user.id}_${Math.random().toString(36).substring(2, 10)}`
+        localStorage.setItem("mini_im_device_token", devToken)
+      }
+      userApi.registerDeviceToken("web", devToken).catch(() => {})
+    }
+  }, [user?.id, token])
+
   const login = async (username: string, password: string) => {
     const res = await authApi.login({ username, password })
     const { token: newToken, user: newUser } = res.data
@@ -56,6 +68,10 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
 
   const logout = async () => {
     const curToken = token || localStorage.getItem('mini_im_token')
+    const devToken = localStorage.getItem("mini_im_device_token")
+    if (devToken) {
+      userApi.unregisterDeviceToken(devToken).catch(() => {})
+    }
     localStorage.removeItem('mini_im_token')
     setToken(null)
     setUser(null)

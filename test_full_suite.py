@@ -3,8 +3,9 @@ import json
 import time
 import websocket
 
-BASE_URL = "http://127.0.0.1:5001/api"
-WS_URL = "ws://127.0.0.1:5001/ws"
+import os
+BASE_URL = os.getenv("BASE_URL", "http://127.0.0.1/api")
+WS_URL = os.getenv("WS_URL", "ws://127.0.0.1/ws")
 
 print("="*60)
 print("MINI-IM FULL MVP END-TO-END AUTOMATED TEST SUITE")

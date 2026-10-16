@@ -23,6 +23,9 @@ class Config:
     REDIS_HOST = os.getenv("REDIS_HOST", "127.0.0.1")
     REDIS_PORT = int(os.getenv("REDIS_PORT", "6379"))
     REDIS_PASSWORD = os.getenv("REDIS_PASSWORD", None)
+    # Redis Cluster Configuration (3 Masters, 3 Replicas)
+    REDIS_CLUSTER_MODE = os.getenv("REDIS_CLUSTER_MODE", "false").lower() == "true"
+    REDIS_CLUSTER_NODES = os.getenv("REDIS_CLUSTER_NODES", "127.0.0.1:7000,127.0.0.1:7001,127.0.0.1:7002,127.0.0.1:7003,127.0.0.1:7004,127.0.0.1:7005")
     
     # Kafka Configuration
     KAFKA_BOOTSTRAP_SERVERS = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "127.0.0.1:9092")
@@ -40,3 +43,18 @@ class Config:
     # Security & Upload Configuration
     MAX_CONTENT_LENGTH = int(os.getenv("MAX_CONTENT_LENGTH", str(25 * 1024 * 1024)))  # 25 MB max payload
     ALLOWED_EXTENSIONS = {"png", "jpg", "jpeg", "gif", "webp", "svg", "pdf", "txt", "doc", "docx", "xls", "xlsx", "zip", "mp4", "mp3"}
+
+    # Production Node & Microservice Cluster Configuration
+    SERVICE_ROLE = os.getenv("SERVICE_ROLE", "all").lower()  # 'all', 'api', 'gateway', 'worker'
+    NODE_ID = os.getenv("NODE_ID", None)
+    if not NODE_ID:
+        import uuid, socket
+        NODE_ID = f"gw_{socket.gethostname()}_{uuid.uuid4().hex[:6]}"
+
+    # Gateway Routing & Heartbeat
+    ROUTE_TTL_SECONDS = int(os.getenv("ROUTE_TTL_SECONDS", "60"))
+    HEARTBEAT_TTL_SECONDS = int(os.getenv("HEARTBEAT_TTL_SECONDS", "45"))
+
+    # Kafka Micro-batch Persistence Tuning (100k Concurrent)
+    KAFKA_BATCH_SIZE = int(os.getenv("KAFKA_BATCH_SIZE", "200"))
+    KAFKA_BATCH_TIMEOUT_MS = int(os.getenv("KAFKA_BATCH_TIMEOUT_MS", "50"))

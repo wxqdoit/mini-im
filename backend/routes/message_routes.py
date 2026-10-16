@@ -113,7 +113,7 @@ def get_message_history():
         sql = f"""
         SELECT m.id, m.conversation_type, m.sender_id, m.recipient_id,
                m.msg_type, m.content, m.media_url, m.file_name, m.file_size,
-               m.is_read, m.is_encrypted, m.iv, m.ephemeral_key, m.encrypted_key_bundle, m.created_at,
+               m.is_read, m.is_encrypted, m.iv, m.ephemeral_key, m.encrypted_key_bundle, m.seq_id, m.created_at,
                json_build_object(
                    'id', u.id,
                    'username', u.username,
@@ -133,6 +133,85 @@ def get_message_history():
     messages.reverse()
 
     return jsonify({"messages": messages})
+
+
+@message_bp.route("/sync", methods=["GET"])
+@token_required
+def sync_messages():
+    """
+    Incremental delta message synchronization by monotonic seq_id.
+    Enables reliable client offline catch-up without missing or repeating messages.
+    """
+    current_user_id = g.current_user["id"]
+    conv_type = request.args.get("type")
+    target_id = request.args.get("target_id", type=int)
+    last_seq_id = request.args.get("last_seq_id", default=0, type=int)
+    limit = min(request.args.get("limit", default=50, type=int), 200)
+
+    if not conv_type or target_id is None:
+        return jsonify({"error": "type and target_id are required"}), 400
+
+    with get_db() as cur:
+        if conv_type == "group":
+            cur.execute("SELECT 1 FROM group_members WHERE group_id = %s AND user_id = %s", (target_id, current_user_id))
+            if not cur.fetchone():
+                return jsonify({"error": "Forbidden: You are not a member of this group"}), 403
+
+        if conv_type == "direct":
+            sql = """
+            SELECT m.id, m.conversation_type, m.sender_id, m.recipient_id,
+                   m.msg_type, m.content, m.media_url, m.file_name, m.file_size,
+                   m.is_read, m.is_encrypted, m.iv, m.ephemeral_key, m.encrypted_key_bundle,
+                   m.seq_id, m.created_at,
+                   json_build_object(
+                       'id', u.id,
+                       'username', u.username,
+                       'nickname', u.nickname,
+                       'avatar', u.avatar
+                   ) as sender
+            FROM messages m
+            JOIN users u ON m.sender_id = u.id
+            WHERE m.conversation_type = 'direct'
+              AND ((m.sender_id = %s AND m.recipient_id = %s) OR (m.sender_id = %s AND m.recipient_id = %s))
+              AND m.seq_id > %s
+            ORDER BY m.seq_id ASC
+            LIMIT %s;
+            """
+            cur.execute(sql, (current_user_id, target_id, target_id, current_user_id, last_seq_id, limit))
+        elif conv_type == "group":
+            sql = """
+            SELECT m.id, m.conversation_type, m.sender_id, m.recipient_id,
+                   m.msg_type, m.content, m.media_url, m.file_name, m.file_size,
+                   m.is_read, m.is_encrypted, m.iv, m.ephemeral_key, m.encrypted_key_bundle,
+                   m.seq_id, m.created_at,
+                   json_build_object(
+                       'id', u.id,
+                       'username', u.username,
+                       'nickname', u.nickname,
+                       'avatar', u.avatar
+                   ) as sender
+            FROM messages m
+            JOIN users u ON m.sender_id = u.id
+            WHERE m.conversation_type = 'group' AND m.recipient_id = %s AND m.seq_id > %s
+            ORDER BY m.seq_id ASC
+            LIMIT %s;
+            """
+            cur.execute(sql, (target_id, last_seq_id, limit))
+        else:
+            return jsonify({"error": "Invalid conversation type"}), 400
+
+        rows = [dict(r) for r in cur.fetchall()]
+        for r in rows:
+            if r.get("created_at"):
+                r["created_at"] = r["created_at"].isoformat()
+
+    return jsonify({
+        "conversation_type": conv_type,
+        "target_id": target_id,
+        "last_seq_id": last_seq_id,
+        "count": len(rows),
+        "messages": rows
+    })
 
 @message_bp.route("/read", methods=["POST"])
 @token_required

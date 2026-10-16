@@ -1,3 +1,4 @@
+import gevent
 import json
 import re
 import threading
@@ -10,14 +11,26 @@ from db import get_db
 from redis_client import (
     get_redis_client, set_user_online, set_user_offline,
     refresh_user_heartbeat, publish_event, get_user_status,
-    get_cached_group_members, cache_group_members
+    get_cached_group_members, cache_group_members,
+    register_user_gateway, refresh_user_gateway, unregister_user_gateway
 )
 from kafka_service import send_to_kafka
 from rate_limiter import check_rate_limit
 
+
+def _async_update_db_user_status(user_id: int, status: str):
+    try:
+        with get_db() as cur:
+            cur.execute("UPDATE users SET status = %s WHERE id = %s", (status, user_id))
+    except Exception:
+        pass
+
 sock = Sock()
 
-# In-memory map: user_id -> set of active ws connections
+# Gateway Node Identity
+NODE_ID = getattr(Config, 'NODE_ID', 'default_gateway')
+
+# In-memory map: user_id -> set of active ws connections on THIS node
 active_connections = defaultdict(set)
 connections_lock = threading.Lock()
 _redis_pubsub_thread = None
@@ -31,37 +44,53 @@ def start_redis_pubsub_listener():
     if _redis_pubsub_thread is None or not _redis_pubsub_thread.is_alive():
         _redis_pubsub_thread = threading.Thread(target=_redis_listener_loop, daemon=True)
         _redis_pubsub_thread.start()
-        print("Redis Pub/Sub listener thread started.")
+        print(f"WebSocket Gateway [{NODE_ID}] Redis Precision Listener thread started.")
 
 def _redis_listener_loop():
     r = get_redis_client()
     pubsub = r.pubsub()
-    pubsub.psubscribe("mini_im:*")
-    print("Subscribed to Redis pattern 'mini_im:*'")
+
+    # 1. High-Performance Precision Node Channel
+    node_channel = f"mini_im:node:{NODE_ID}"
+    pubsub.subscribe(node_channel, "mini_im:broadcast", "mini_im:presence", "mini_im:user_profile_updated")
+    
+    # Also pattern-subscribe to legacy channels for backwards compatibility
+    pubsub.psubscribe("mini_im:user:*", "mini_im:group:*")
+    print(f"Node [{NODE_ID}] subscribed to precision channel: {node_channel}")
 
     for message in pubsub.listen():
-        if message["type"] not in ["pmessage", "message"]:
+        msg_type = message["type"]
+        if msg_type not in ["pmessage", "message"]:
             continue
         try:
             channel = message["channel"]
             raw_data = message["data"]
             data = json.loads(raw_data) if isinstance(raw_data, str) else raw_data
-            
-            # 1. Direct user event: mini_im:user:<user_id>
-            user_match = re.match(r"^mini_im:user:(\d+)$", channel)
-            if user_match:
-                target_uid = int(user_match.group(1))
-                _send_to_user(target_uid, data)
+
+            # Case A: Precision Node Message (Targeted dispatch to local connections)
+            if channel == node_channel:
+                target_user_ids = data.get("target_user_ids")
+                if target_user_ids:
+                    # Filter data to transmit
+                    event_payload = {
+                        "event": data.get("event"),
+                        "data": data.get("data")
+                    }
+                    for uid in target_user_ids:
+                        _send_to_user(uid, event_payload)
+                else:
+                    # Single targeted user payload
+                    uid = data.get("user_id") or data.get("data", {}).get("recipient_id")
+                    if uid:
+                        _send_to_user(uid, data)
                 continue
 
-            # 2. Group event: mini_im:group:<group_id>
-            group_match = re.match(r"^mini_im:group:(\d+)$", channel)
-            if group_match:
-                group_id = int(group_match.group(1))
-                _send_to_group(group_id, data)
+            # Case B: Global Broadcast
+            if channel == "mini_im:broadcast":
+                _broadcast_all(data)
                 continue
 
-            # 3. Targeted presence & profile update: push only to friends to eliminate O(N^2) broadcast storms
+            # Case C: Targeted presence & profile update (push to friends)
             if channel in ["mini_im:user_profile_updated", "mini_im:presence"]:
                 user_id = data.get("data", {}).get("user_id") or data.get("user", {}).get("id")
                 if user_id:
@@ -70,13 +99,30 @@ def _redis_listener_loop():
                     _broadcast_all(data)
                 continue
 
+            # Case D: Backward-compatible Direct User channel
+            user_match = re.match(r"^mini_im:user:(\d+)$", channel)
+            if user_match:
+                target_uid = int(user_match.group(1))
+                _send_to_user(target_uid, data)
+                continue
+
+            # Case E: Backward-compatible Group channel
+            group_match = re.match(r"^mini_im:group:(\d+)$", channel)
+            if group_match:
+                group_id = int(group_match.group(1))
+                _send_to_group(group_id, data)
+                continue
+
         except Exception as e:
-            print(f"Error handling Redis pubsub message: {e}")
+            print(f"Error handling Redis pubsub message on [{NODE_ID}]: {e}")
 
 def _send_to_user(user_id, data):
     with connections_lock:
         sockets = list(active_connections.get(user_id, set()))
     
+    if not sockets:
+        return
+
     dead_sockets = []
     payload_str = json.dumps(data, default=str)
     for ws in sockets:
@@ -91,14 +137,9 @@ def _send_to_user(user_id, data):
                 active_connections[user_id].discard(dws)
 
 def _get_group_members_fast(group_id: int):
-    """
-    Cached group member retrieval. Checks Redis first; falls back to DB on cache miss.
-    """
     members = get_cached_group_members(group_id)
     if members is not None:
         return members
-    
-    # Query DB and cache in Redis
     try:
         with get_db() as cur:
             cur.execute("SELECT user_id FROM group_members WHERE group_id = %s", (group_id,))
@@ -130,9 +171,6 @@ def _send_to_group(group_id, data):
                     active_connections[uid].discard(dws)
 
 def _notify_friends(user_id, data):
-    """
-    Targeted fan-out: only notify friends of status/profile updates rather than full-world broadcast.
-    """
     friend_ids = []
     try:
         with get_db() as cur:
@@ -169,12 +207,9 @@ def close_user_connections(user_id):
         except Exception:
             pass
 
+    unregister_user_gateway(user_id, NODE_ID)
     set_user_offline(user_id)
-    try:
-        with get_db() as cur:
-            cur.execute("UPDATE users SET status = 'offline' WHERE id = %s", (user_id,))
-    except Exception:
-        pass
+    gevent.spawn(_async_update_db_user_status, user_id, "offline")
 
     publish_event("mini_im:presence", {
         "event": "user_status_changed",
@@ -213,25 +248,24 @@ def handle_websocket(ws):
     with connections_lock:
         active_connections[user_id].add(ws)
 
+    # Register user to this gateway node in Redis Precision Router
+    register_user_gateway(user_id, NODE_ID)
     set_user_online(user_id, "online")
-    try:
-        with get_db() as cur:
-            cur.execute("UPDATE users SET status = 'online' WHERE id = %s", (user_id,))
-    except Exception:
-        pass
+    gevent.spawn(_async_update_db_user_status, user_id, "online")
 
     publish_event("mini_im:presence", {
         "event": "user_status_changed",
         "data": {"user_id": user_id, "status": "online", "is_online": True}
     })
 
-    # Acknowledge connection
+    # Acknowledge connection with node identity
     try:
         ws.send(json.dumps({
             "event": "connected",
             "data": {
                 "user_id": user_id,
-                "message": "Connected to Mini IM WebSocket Server"
+                "node_id": NODE_ID,
+                "message": f"Connected to Mini IM WebSocket Gateway ({NODE_ID})"
             }
         }))
     except Exception:
@@ -250,16 +284,83 @@ def handle_websocket(ws):
 
             msg_type = msg_data.get("type")
 
-            # Heartbeat Ping -> Pong + Touch TTL
+            # 1. Heartbeat Ping -> Pong + Touch TTL + Refresh Node Route
             if msg_type == "ping":
                 refresh_user_heartbeat(user_id)
+                refresh_user_gateway(user_id)
                 try:
                     ws.send(json.dumps({"type": "pong"}))
                 except Exception:
                     break
                 continue
 
-            # Chat message sent via WebSocket
+            # 2. Client Message ACK (Reliable Delivery Protocol)
+            if msg_type == "ack":
+                msg_id = msg_data.get("msg_id")
+                if msg_id:
+                    try:
+                        with get_db() as cur:
+                            cur.execute(
+                                "UPDATE messages SET is_read = TRUE WHERE id = %s AND recipient_id = %s",
+                                (msg_id, user_id)
+                            )
+                    except Exception as e:
+                        print(f"Error processing client ACK: {e}")
+                continue
+
+            # 3. Incremental Delta Sync Protocol (Offline Message Recovery)
+            if msg_type == "sync":
+                conv_type = msg_data.get("conversation_type")
+                target_id = msg_data.get("target_id")
+                last_seq_id = msg_data.get("last_seq_id", 0)
+                if conv_type and target_id is not None:
+                    try:
+                        with get_db() as cur:
+                            if conv_type == "direct":
+                                cur.execute("""
+                                    SELECT m.id, m.conversation_type, m.sender_id, m.recipient_id,
+                                           m.msg_type, m.content, m.media_url, m.file_name, m.file_size,
+                                           m.is_read, m.is_encrypted, m.iv, m.ephemeral_key, m.encrypted_key_bundle,
+                                           m.seq_id, m.created_at,
+                                           json_build_object('id', u.id, 'username', u.username, 'nickname', u.nickname, 'avatar', u.avatar) as sender
+                                    FROM messages m
+                                    JOIN users u ON m.sender_id = u.id
+                                    WHERE m.conversation_type = 'direct'
+                                      AND ((m.sender_id = %s AND m.recipient_id = %s) OR (m.sender_id = %s AND m.recipient_id = %s))
+                                      AND m.seq_id > %s
+                                    ORDER BY m.seq_id ASC LIMIT 100;
+                                """, (user_id, target_id, target_id, user_id, last_seq_id))
+                            elif conv_type == "group":
+                                cur.execute("""
+                                    SELECT m.id, m.conversation_type, m.sender_id, m.recipient_id,
+                                           m.msg_type, m.content, m.media_url, m.file_name, m.file_size,
+                                           m.is_read, m.is_encrypted, m.iv, m.ephemeral_key, m.encrypted_key_bundle,
+                                           m.seq_id, m.created_at,
+                                           json_build_object('id', u.id, 'username', u.username, 'nickname', u.nickname, 'avatar', u.avatar) as sender
+                                    FROM messages m
+                                    JOIN users u ON m.sender_id = u.id
+                                    WHERE m.conversation_type = 'group' AND m.recipient_id = %s AND m.seq_id > %s
+                                    ORDER BY m.seq_id ASC LIMIT 100;
+                                """, (target_id, last_seq_id))
+                            delta_msgs = [dict(r) for r in cur.fetchall()]
+                            for r in delta_msgs:
+                                if r.get("created_at"):
+                                    r["created_at"] = r["created_at"].isoformat()
+
+                            ws.send(json.dumps({
+                                "event": "sync_delta",
+                                "data": {
+                                    "conversation_type": conv_type,
+                                    "target_id": target_id,
+                                    "last_seq_id": last_seq_id,
+                                    "messages": delta_msgs
+                                }
+                            }, default=str))
+                    except Exception as e:
+                        print(f"Error handling sync request: {e}")
+                continue
+
+            # 4. Chat message sent via WebSocket
             if msg_type == "chat_message":
                 # Rate limit: max 25 msgs per 5s per user
                 rl_key = f"mini_im:ratelimit:ws_chat:{user_id}"
@@ -316,7 +417,7 @@ def handle_websocket(ws):
                     )
 
     except Exception as e:
-        print(f"WebSocket closed/error for user {user_id}: {e}")
+        print(f"WebSocket closed/error for user {user_id} on [{NODE_ID}]: {e}")
     finally:
         with connections_lock:
             active_connections[user_id].discard(ws)
@@ -325,12 +426,9 @@ def handle_websocket(ws):
                 active_connections.pop(user_id, None)
 
         if is_empty:
+            unregister_user_gateway(user_id, NODE_ID)
             set_user_offline(user_id)
-            try:
-                with get_db() as cur:
-                    cur.execute("UPDATE users SET status = 'offline' WHERE id = %s", (user_id,))
-            except Exception:
-                pass
+            gevent.spawn(_async_update_db_user_status, user_id, "offline")
 
             publish_event("mini_im:presence", {
                 "event": "user_status_changed",

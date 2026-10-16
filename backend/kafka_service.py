@@ -4,8 +4,11 @@ import time
 from confluent_kafka import Producer, Consumer, KafkaError
 from confluent_kafka.admin import AdminClient, NewTopic
 from config import Config
-from db import get_db
-from redis_client import publish_event, set_user_online
+from db import get_db, bulk_insert_messages
+from redis_client import (
+    publish_event, get_next_seq_id, get_cached_group_members,
+    cache_group_members, publish_to_gateways_for_users
+)
 
 _kafka_producer = None
 _consumer_thread = None
@@ -34,7 +37,8 @@ def get_kafka_producer():
             'client.id': 'mini_im_producer',
             'retries': 3,
             'retry.backoff.ms': 100,
-            'linger.ms': 0,
+            'linger.ms': 5,
+            'batch.num.messages': 1000,
             'queue.buffering.max.messages': 100000,
         }
         _kafka_producer = Producer(conf)
@@ -43,9 +47,19 @@ def get_kafka_producer():
 def send_to_kafka(topic, key, data):
     """
     Non-blocking asynchronous message production into Kafka topic.
-    Calls poll(0) to serve delivery reports without blocking the sender thread.
+    Automatically assigns monotonic 64-bit sequence ID (SeqID) to guarantee total order.
     """
     try:
+        # Assign monotonic sequence ID if not already present
+        if not data.get("seq_id"):
+            conv_type = data.get("conversation_type")
+            sender_id = data.get("sender_id")
+            recipient_id = data.get("recipient_id")
+            if conv_type == "direct" and sender_id and recipient_id:
+                data["seq_id"] = get_next_seq_id("direct", sender_id, recipient_id)
+            elif conv_type == "group" and recipient_id:
+                data["seq_id"] = get_next_seq_id("group", recipient_id)
+
         producer = get_kafka_producer()
         payload = json.dumps(data, default=str).encode('utf-8')
         producer.produce(
@@ -54,14 +68,13 @@ def send_to_kafka(topic, key, data):
             value=payload,
             callback=delivery_report
         )
-        # Non-blocking poll to trigger queued callbacks
-        producer.flush(timeout=0.2)
+        producer.poll(0)
         return True
     except Exception as e:
         print(f"Failed to produce to Kafka: {e}")
-        # Fallback: process directly so messages never get lost
+        # High-availability Fallback: process directly so messages are never lost
         try:
-            _process_kafka_message(data)
+            _process_kafka_batch([data])
             return True
         except Exception as ex:
             print(f"Fallback direct processing error: {ex}")
@@ -73,7 +86,7 @@ def delivery_report(err, msg):
 
 def start_kafka_consumer():
     """
-    Starts the Kafka consumer background thread.
+    Starts the Kafka consumer background thread with micro-batching.
     """
     ensure_topic_exists()
     global _consumer_thread
@@ -81,7 +94,7 @@ def start_kafka_consumer():
         _stop_consumer.clear()
         _consumer_thread = threading.Thread(target=_kafka_consumer_loop, daemon=True)
         _consumer_thread.start()
-        print("Kafka consumer background thread started.")
+        print("Kafka micro-batching consumer background thread started.")
 
 def _kafka_consumer_loop():
     def on_assign(c, partitions):
@@ -96,111 +109,89 @@ def _kafka_consumer_loop():
         'heartbeat.interval.ms': 1000
     }
     
+    batch_size = getattr(Config, 'KAFKA_BATCH_SIZE', 200)
+    batch_timeout = getattr(Config, 'KAFKA_BATCH_TIMEOUT_MS', 50) / 1000.0
+
     while not _stop_consumer.is_set():
         try:
             consumer = Consumer(conf)
             consumer.subscribe([Config.KAFKA_MSG_TOPIC], on_assign=on_assign)
-            print(f"Kafka consumer subscribed to {Config.KAFKA_MSG_TOPIC}")
+            print(f"Kafka consumer subscribed to {Config.KAFKA_MSG_TOPIC} (batch_size={batch_size})")
             
             while not _stop_consumer.is_set():
-                msg = consumer.poll(timeout=0.2)
-                if msg is None:
-                    time.sleep(0.05)
+                msgs = consumer.consume(num_messages=batch_size, timeout=batch_timeout)
+                if not msgs:
+                    time.sleep(0.01)
                     continue
-                if msg.error():
-                    if msg.error().code() == KafkaError._PARTITION_EOF:
-                        continue
-                    else:
+
+                batch_items = []
+                for msg in msgs:
+                    if msg.error():
+                        if msg.error().code() == KafkaError._PARTITION_EOF:
+                            continue
                         print(f"Kafka consumer error: {msg.error()}")
-                        time.sleep(1)
                         continue
+                    try:
+                        payload = json.loads(msg.value().decode('utf-8'))
+                        if payload.get("event_type") == "chat_message":
+                            batch_items.append(payload)
+                    except Exception as ex:
+                        print(f"Error decoding Kafka message: {ex}")
                 
-                try:
-                    payload = json.loads(msg.value().decode('utf-8'))
-                    _process_kafka_message(payload)
-                except Exception as ex:
-                    print(f"Error processing Kafka message: {ex}")
+                if batch_items:
+                    try:
+                        _process_kafka_batch(batch_items)
+                    except Exception as ex:
+                        print(f"Error processing Kafka batch: {ex}")
             
             consumer.close()
         except Exception as e:
             print(f"Kafka consumer connection error: {e}. Retrying in 2 seconds...")
             time.sleep(2)
 
-def _process_kafka_message(data):
+def _get_group_members_cached(group_id: int) -> set:
+    members = get_cached_group_members(group_id)
+    if members is not None:
+        return members
+    try:
+        with get_db() as cur:
+            cur.execute("SELECT user_id FROM group_members WHERE group_id = %s", (group_id,))
+            m_ids = [row["user_id"] for row in cur.fetchall()]
+        cache_group_members(group_id, m_ids)
+        return set(m_ids)
+    except Exception as e:
+        print(f"Error fetching group members: {e}")
+        return set()
+
+def _process_kafka_batch(messages_batch: list):
     """
-    Consumes chat message from Kafka, saves it into PostgreSQL,
-    and publishes real-time notification to Redis channels.
+    Consumes a micro-batch of chat messages, saves them into PostgreSQL via bulk_insert_messages,
+    and dispatches them using Precision Gateway Routing.
     """
-    event_type = data.get("event_type", "chat_message")
-    if event_type != "chat_message":
+    if not messages_batch:
         return
 
-    conv_type = data.get("conversation_type")  # 'direct' or 'group'
-    sender_id = data.get("sender_id")
-    recipient_id = data.get("recipient_id")
-    msg_type = data.get("msg_type", "text")
-    content = data.get("content", "")
-    media_url = data.get("media_url", "")
-    file_name = data.get("file_name", "")
-    file_size = data.get("file_size", 0)
-    is_encrypted = data.get("is_encrypted", False)
-    iv = data.get("iv", "")
-    ephemeral_key = data.get("ephemeral_key", "")
-    encrypted_key_bundle = data.get("encrypted_key_bundle", None)
-    if isinstance(encrypted_key_bundle, dict):
-        encrypted_key_bundle_json = json.dumps(encrypted_key_bundle)
-    else:
-        encrypted_key_bundle_json = encrypted_key_bundle
+    # 1. Bulk insert all messages in one DB round trip
+    persisted_messages = bulk_insert_messages(messages_batch)
 
-    # 1. Insert into PostgreSQL
-    saved_msg = None
-    with get_db() as cur:
-        # Fetch sender info
-        cur.execute("SELECT id, username, nickname, avatar FROM users WHERE id = %s", (sender_id,))
-        sender = cur.fetchone()
-
-        insert_sql = """
-            INSERT INTO messages (
-                conversation_type, sender_id, recipient_id, 
-                msg_type, content, media_url, file_name, file_size, 
-                is_read, is_encrypted, iv, ephemeral_key, encrypted_key_bundle
-            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, FALSE, %s, %s, %s, %s)
-            RETURNING id, created_at;
-        """
-        cur.execute(insert_sql, (
-            conv_type, sender_id, recipient_id, 
-            msg_type, content, media_url, file_name, file_size,
-            is_encrypted, iv, ephemeral_key, encrypted_key_bundle_json
-        ))
-        row = cur.fetchone()
+    # 2. Dispatch events with Precision Routing
+    for saved_msg in persisted_messages:
+        conv_type = saved_msg.get("conversation_type")
+        sender_id = saved_msg.get("sender_id")
+        recipient_id = saved_msg.get("recipient_id")
         
-        saved_msg = {
-            "id": row["id"],
-            "conversation_type": conv_type,
-            "sender_id": sender_id,
-            "recipient_id": recipient_id,
-            "msg_type": msg_type,
-            "content": content,
-            "media_url": media_url,
-            "file_name": file_name,
-            "file_size": file_size,
-            "is_read": False,
-            "is_encrypted": is_encrypted,
-            "iv": iv,
-            "ephemeral_key": ephemeral_key,
-            "encrypted_key_bundle": encrypted_key_bundle,
-            "created_at": row["created_at"].isoformat() if row["created_at"] else None,
-            "sender": dict(sender) if sender else None
+        event_payload = {
+            "event": "new_message",
+            "data": saved_msg
         }
 
-    # 2. Publish to Redis for WebSocket distribution
-    event_payload = {
-        "event": "new_message",
-        "data": saved_msg
-    }
+        if conv_type == "direct":
+            # Precision routing directly to sender & recipient active gateway nodes
+            publish_to_gateways_for_users([recipient_id, sender_id], event_payload)
+        elif conv_type == "group":
+            member_ids = _get_group_members_cached(recipient_id)
+            if member_ids:
+                publish_to_gateways_for_users(list(member_ids), event_payload)
 
-    if conv_type == "direct":
-        publish_event(f"mini_im:user:{recipient_id}", event_payload)
-        publish_event(f"mini_im:user:{sender_id}", event_payload)
-    elif conv_type == "group":
-        publish_event(f"mini_im:group:{recipient_id}", event_payload)
+def _process_kafka_message(single_data: dict):
+    _process_kafka_batch([single_data])

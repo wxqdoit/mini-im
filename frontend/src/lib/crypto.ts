@@ -93,6 +93,20 @@ export async function getRecipientPublicKey(recipientId: number): Promise<string
 /**
  * Encrypt a direct message for a recipient using ECDH Ephemeral Key + AES-256-GCM
  */
+/**
+ * Cache outgoing plaintext by IV so the sender can view and match optimistic messages or load history
+ */
+export function cacheSentPlaintext(iv: string, plaintext: string) {
+  if (!iv || !plaintext) return
+  try {
+    localStorage.setItem(`mini_im_sent_txt_${iv}`, plaintext)
+    const allKeys = Object.keys(localStorage).filter(k => k.startsWith("mini_im_sent_txt_"))
+    if (allKeys.length > 500) {
+      allKeys.slice(0, allKeys.length - 300).forEach(k => localStorage.removeItem(k))
+    }
+  } catch (_) {}
+}
+
 export async function encryptDirectMessage(
   senderId: number,
   recipientId: number,
@@ -150,11 +164,13 @@ export async function encryptDirectMessage(
     )
 
     const ephemeralPubJwk = await window.crypto.subtle.exportKey('jwk', ephemeral.publicKey)
+    const ivB64 = bufferToBase64(iv)
+    cacheSentPlaintext(ivB64, plaintext)
 
     return {
       content: bufferToBase64(cipherBuffer),
       is_encrypted: true,
-      iv: bufferToBase64(iv),
+      iv: ivB64,
       ephemeral_key: JSON.stringify(ephemeralPubJwk),
     }
   } catch (err) {
@@ -189,6 +205,13 @@ export async function decryptDirectMessage(
   // If I sent this message, I cannot decrypt with peer's private key unless I cached the plaintext or ephemeral
   // For outgoing optimistic messages, plaintext is already cached. If loading history, show preview or cached
   if (Number(msg.sender_id) === Number(currentUserId)) {
+    if (msg.iv) {
+      try {
+        const cached = localStorage.getItem(`mini_im_sent_txt_${msg.iv}`) ||
+                       sessionStorage.getItem(`mini_im_sent_txt_${msg.iv}`)
+        if (cached) return cached
+      } catch (_) {}
+    }
     // If it's already plaintext (e.g. from local memory), return it
     if (!msg.content.match(/^[A-Za-z0-9+/=]+$/) || msg.content.length < 16) {
       return msg.content
@@ -294,11 +317,13 @@ export async function encryptGroupMessage(
       groupKey,
       encoded
     )
+    const ivB64 = bufferToBase64(iv)
+    cacheSentPlaintext(ivB64, plaintext)
 
     return {
       content: bufferToBase64(cipherBuffer),
       is_encrypted: true,
-      iv: bufferToBase64(iv),
+      iv: ivB64,
     }
   } catch (e) {
     console.error('[E2EE] Group message encryption failed:', e)

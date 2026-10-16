@@ -260,11 +260,18 @@ export const ChatProvider: React.FC<{ children: React.ReactNode }> = ({ children
       // Decrypt if E2EE protected
       if (newMsg.is_encrypted && newMsg.msg_type === 'text') {
         const curUid = currentUser?.id || 0
-        if (Number(newMsg.sender_id) !== Number(curUid)) {
-          if (newMsg.conversation_type === 'direct') {
-            newMsg.content = await decryptDirectMessage(curUid, newMsg)
-          } else {
-            newMsg.content = await decryptGroupMessage(newMsg.recipient_id, newMsg)
+        if (newMsg.conversation_type === 'group') {
+          // Group chats share symmetric key: all members (including sender) decrypt
+          newMsg.content = await decryptGroupMessage(newMsg.recipient_id, newMsg)
+        } else if (Number(newMsg.sender_id) !== Number(curUid)) {
+          newMsg.content = await decryptDirectMessage(curUid, newMsg)
+        } else {
+          if (newMsg.iv) {
+            try {
+              const cached = localStorage.getItem(`mini_im_sent_txt_${newMsg.iv}`) ||
+                             sessionStorage.getItem(`mini_im_sent_txt_${newMsg.iv}`)
+              if (cached) newMsg.content = cached
+            } catch (_) {}
           }
         }
       }
@@ -297,13 +304,20 @@ export const ChatProvider: React.FC<{ children: React.ReactNode }> = ({ children
             Number(m.sender_id) === Number(newMsg.sender_id) &&
             m.msg_type === newMsg.msg_type &&
             (
+              (Boolean(newMsg.iv) && Boolean(m.iv) && newMsg.iv === m.iv) ||
               m.content === newMsg.content ||
               (newMsg.media_url && (m.media_url === newMsg.media_url || m.media_url?.startsWith("blob:")))
             )
           )
           if (tempIdx !== -1) {
             const copy = [...prev]
-            copy[tempIdx] = newMsg
+            const preservedContent = (Number(newMsg.sender_id) === Number(currentUser?.id) && copy[tempIdx].content)
+              ? copy[tempIdx].content
+              : newMsg.content
+            copy[tempIdx] = {
+              ...newMsg,
+              content: preservedContent || newMsg.content,
+            }
             return copy
           }
           if (prev.some(m => m.id === newMsg.id)) return prev
@@ -515,8 +529,24 @@ export const ChatProvider: React.FC<{ children: React.ReactNode }> = ({ children
         // Fetch latest messages if chat is already active
         const cur = activeConversationRef.current
         if (cur) {
-          messageApi.getHistory(cur.type, cur.target_id).then(res => {
-            setMessages(res.data.messages)
+          messageApi.getHistory(cur.type, cur.target_id).then(async res => {
+            const rawList = res.data.messages || []
+            const currentUid = userRef.current?.id || 0
+            const decryptedList = await Promise.all(
+              rawList.map(async (m: Message) => {
+                if (m.is_encrypted && m.msg_type === 'text') {
+                  if (cur.type === 'direct') {
+                    const dec = await decryptDirectMessage(currentUid, m)
+                    return { ...m, content: dec }
+                  } else {
+                    const dec = await decryptGroupMessage(cur.target_id, m)
+                    return { ...m, content: dec }
+                  }
+                }
+                return m
+              })
+            )
+            setMessages(decryptedList)
           }).catch(() => {})
         }
 

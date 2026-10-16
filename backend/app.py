@@ -7,6 +7,7 @@ try:
 except ImportError:
     pass
 
+import os
 from gevent.pywsgi import WSGIServer
 from gevent.pool import Pool
 
@@ -27,37 +28,52 @@ from routes.message_routes import message_bp
 from routes.upload_routes import upload_bp
 from routes.e2ee_routes import e2ee_bp
 
-def create_app():
+def create_app(role: str = None):
     app = Flask(__name__)
     app.config.from_object(Config)
+
+    role = (role or Config.SERVICE_ROLE or "all").lower()
+    app.config["SERVICE_ROLE"] = role
 
     # Enable CORS for API routes
     CORS(app, resources={r"/api/*": {"origins": "*"}}, supports_credentials=True)
 
-    # Initialize components
+    # Initialize shared storage & database pools
     init_db_pool()
-    init_tables()
-    reset_all_online_presence()
-    init_minio_bucket()
-    start_kafka_consumer()
+    if role in ["all", "api"]:
+        init_tables()
 
-    # Register WebSocket handler
-    register_websocket(app)
+    if role in ["all", "api", "gateway"]:
+        init_minio_bucket()
 
-    # Register blueprints
-    app.register_blueprint(auth_bp)
-    app.register_blueprint(user_bp)
-    app.register_blueprint(friend_bp)
-    app.register_blueprint(group_bp)
-    app.register_blueprint(message_bp)
-    app.register_blueprint(upload_bp)
-    app.register_blueprint(e2ee_bp)
+    if role in ["all"]:
+        reset_all_online_presence()
+
+    # Worker role or all-in-one runs Kafka background consumer
+    if role in ["all", "worker"]:
+        start_kafka_consumer()
+
+    # Gateway role or all-in-one registers WebSocket engine & precision listener
+    if role in ["all", "gateway"]:
+        register_websocket(app)
+
+    # API role or all-in-one registers REST blueprints
+    if role in ["all", "api"]:
+        app.register_blueprint(auth_bp)
+        app.register_blueprint(user_bp)
+        app.register_blueprint(friend_bp)
+        app.register_blueprint(group_bp)
+        app.register_blueprint(message_bp)
+        app.register_blueprint(upload_bp)
+        app.register_blueprint(e2ee_bp)
 
     @app.route("/api/health", methods=["GET"])
     def health_check():
         return jsonify({
             "status": "healthy",
             "server": "Gevent-Async-Engine",
+            "service_role": role,
+            "node_id": getattr(Config, "NODE_ID", "unknown"),
             "max_concurrency": 15000,
             "services": {
                 "postgres": "ok",
@@ -70,19 +86,23 @@ def create_app():
     return app
 
 if __name__ == "__main__":
-    app = create_app()
+    role = Config.SERVICE_ROLE
+    port = int(os.getenv("PORT", "5001"))
+    app = create_app(role)
+
     pool = Pool(15000)
     server = WSGIServer(
-        ("0.0.0.0", 5001),
+        ("0.0.0.0", port),
         app,
         spawn=pool,
         backlog=2048,
         log=None,
         error_log=None
     )
-    print("=" * 60)
-    print("Mini IM High-Concurrency Backend (Gevent Async IO Engine)")
-    print("Listening on: http://0.0.0.0:5001")
-    print("Coroutine Pool Capacity: 15,000 simultaneous connections")
-    print("=" * 60)
+    print("=" * 65)
+    print(f"Mini IM High-Concurrency Server [Role: {role.upper()}]")
+    print(f"Node ID: {Config.NODE_ID}")
+    print(f"Listening on: http://0.0.0.0:{port}")
+    print("Coroutine Pool Capacity: 15,000 simultaneous connections per instance")
+    print("=" * 65)
     server.serve_forever()

@@ -14,7 +14,7 @@ from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
 sys.path.append(os.path.join(os.path.dirname(__file__), 'backend'))
 from db import get_db
 
-BASE_URL = "http://127.0.0.1:5001/api"
+BASE_URL = os.getenv("BASE_URL", "http://127.0.0.1/api")
 
 print("="*65)
 print("MINI-IM END-TO-END ENCRYPTION (E2EE) CRYPTOGRAPHIC TEST")

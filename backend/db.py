@@ -1,6 +1,7 @@
 import psycopg2
 from psycopg2 import pool
-from psycopg2.extras import RealDictCursor
+from psycopg2.extras import RealDictCursor, execute_values
+import json
 from contextlib import contextmanager
 from config import Config
 
@@ -50,6 +51,41 @@ def get_db():
     finally:
         if conn is not None:
             connection_pool.putconn(conn)
+
+
+def ensure_monthly_partitions():
+    """
+    Guarantees current and upcoming monthly partitions exist, plus a DEFAULT fallback partition.
+    """
+    import datetime
+    now = datetime.datetime.utcnow()
+    with get_db() as cur:
+        # Check if messages table is partitioned
+        cur.execute("SELECT relkind FROM pg_class WHERE relname = 'messages';")
+        row = cur.fetchone()
+        if not row or row['relkind'] != 'p':
+            return
+
+        # Ensure default partition exists
+        cur.execute("CREATE TABLE IF NOT EXISTS messages_default PARTITION OF messages DEFAULT;")
+
+        # Create partitions for current month + next 3 months
+        for m_offset in range(4):
+            # Calculate year and month
+            year = now.year + (now.month - 1 + m_offset) // 12
+            month = (now.month - 1 + m_offset) % 12 + 1
+            part_name = f"messages_{year}_{month:02d}"
+            
+            start_date = f"{year}-{month:02d}-01 00:00:00"
+            if month == 12:
+                end_date = f"{year + 1}-01-01 00:00:00"
+            else:
+                end_date = f"{year}-{month + 1:02d}-01 00:00:00"
+                
+            cur.execute(f"""
+                CREATE TABLE IF NOT EXISTS {part_name} PARTITION OF messages
+                FOR VALUES FROM ('{start_date}') TO ('{end_date}');
+            """)
 
 def init_tables():
     create_schema_sql = """
@@ -156,11 +192,84 @@ def init_tables():
         CONSTRAINT uq_group_key_version UNIQUE (group_id, key_version)
     );
 
-    ALTER TABLE messages ADD COLUMN IF NOT EXISTS is_encrypted BOOLEAN DEFAULT FALSE;
+ALTER TABLE messages ADD COLUMN IF NOT EXISTS is_encrypted BOOLEAN DEFAULT FALSE;
     ALTER TABLE messages ADD COLUMN IF NOT EXISTS iv VARCHAR(64) DEFAULT '';
     ALTER TABLE messages ADD COLUMN IF NOT EXISTS ephemeral_key TEXT DEFAULT '';
     ALTER TABLE messages ADD COLUMN IF NOT EXISTS encrypted_key_bundle JSONB DEFAULT NULL;
+    ALTER TABLE messages ADD COLUMN IF NOT EXISTS seq_id BIGINT DEFAULT 0;
+
+    CREATE INDEX IF NOT EXISTS idx_messages_seq_direct 
+    ON messages(sender_id, recipient_id, seq_id)
+    WHERE conversation_type = 'direct';
+
+    CREATE INDEX IF NOT EXISTS idx_messages_seq_group 
+    ON messages(recipient_id, seq_id)
+    WHERE conversation_type = 'group';
     """
     with get_db() as cur:
         cur.execute(create_schema_sql)
-    print("Database tables & indexes initialized successfully!")
+    ensure_monthly_partitions()
+    print("Database tables, partitions & indexes initialized successfully!")
+
+
+def bulk_insert_messages(messages_list):
+    """
+    High-throughput micro-batching message persistence using execute_values.
+    Inserts a list of messages in a single DB round-trip transaction.
+    """
+    if not messages_list:
+        return []
+    
+    tuples_to_insert = []
+    sender_ids = set()
+    for m in messages_list:
+        sender_ids.add(m.get("sender_id"))
+        ekb = m.get("encrypted_key_bundle")
+        if isinstance(ekb, dict):
+            ekb_json = json.dumps(ekb)
+        else:
+            ekb_json = ekb
+        tuples_to_insert.append((
+            m.get("conversation_type"),
+            m.get("sender_id"),
+            m.get("recipient_id"),
+            m.get("msg_type", "text"),
+            m.get("content", ""),
+            m.get("media_url", ""),
+            m.get("file_name", ""),
+            m.get("file_size", 0),
+            False,
+            m.get("is_encrypted", False),
+            m.get("iv", ""),
+            m.get("ephemeral_key", ""),
+            ekb_json,
+            m.get("seq_id", 0)
+        ))
+
+    sql = """
+        INSERT INTO messages (
+            conversation_type, sender_id, recipient_id,
+            msg_type, content, media_url, file_name, file_size,
+            is_read, is_encrypted, iv, ephemeral_key, encrypted_key_bundle, seq_id
+        ) VALUES %s
+        RETURNING id, conversation_type, sender_id, recipient_id, msg_type, content,
+                  media_url, file_name, file_size, is_read, is_encrypted, iv,
+                  ephemeral_key, encrypted_key_bundle, seq_id, created_at;
+    """
+
+    with get_db() as cur:
+        sender_map = {}
+        if sender_ids:
+            cur.execute("SELECT id, username, nickname, avatar FROM users WHERE id = ANY(%s)", (list(sender_ids),))
+            for row in cur.fetchall():
+                sender_map[row["id"]] = dict(row)
+
+        inserted_rows = execute_values(cur, sql, tuples_to_insert, fetch=True)
+        result = []
+        for row in inserted_rows:
+            m_dict = dict(row)
+            if m_dict.get("created_at"):
+                m_dict["created_at"] = m_dict["created_at"].isoformat()
+            m_dict["sender"] = sender_map.get(m_dict["sender_id"])
+            result.append(m_dict)
+        return result

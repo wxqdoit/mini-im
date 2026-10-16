@@ -1,0 +1,129 @@
+# ==========================================
+# Operating System Files
+# ==========================================
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+[Dd]esktop.ini
+
+# ==========================================
+# Editors & IDEs
+# ==========================================
+.idea/
+.vscode/*
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
+!.vscode/extensions.json
+*.sublime-workspace
+*.sublime-project
+*.swp
+*.swo
+*~
+
+# ==========================================
+# Environment Variables & Secrets
+# ==========================================
+.env
+.env.*
+*.env
+!.env.example
+!.env.template
+
+# ==========================================
+# Logs & Process IDs
+# ==========================================
+*.log
+logs/
+*.pid
+*.seed
+*.pid.lock
+
+# ==========================================
+# Python (Backend)
+# ==========================================
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Distribution / packaging
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual Environments
+venv/
+.venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+
+# Testing & Coverage
+.cache
+.pytest_cache/
+.coverage
+.coverage.*
+nosetests.xml
+coverage.xml
+*.cover
+*.py,cover
+.hypothesis/
+htmlcov/
+.tox/
+.nox/
+
+# Type Checking & Linters
+.mypy_cache/
+.pyre/
+.pytype/
+.ruff_cache/
+
+# ==========================================
+# Node.js & Frontend
+# ==========================================
+node_modules/
+dist/
+dist-ssr/
+.vite/
+.vite-temp/
+*.local
+
+# npm / yarn / pnpm debug logs
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+# ==========================================
+# Databases & Local Storage
+# ==========================================
+*.sqlite
+*.sqlite3
+*.db
+
+# ==========================================
+# Temporary Files
+# ==========================================
+*.tmp
+*.temp
+.tmp/

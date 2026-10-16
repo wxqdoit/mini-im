@@ -1,6 +1,7 @@
 import json
 import uuid
 import os
+from io import BytesIO
 from minio import Minio
 from minio.error import S3Error
 from config import Config
@@ -24,28 +25,25 @@ def init_minio_bucket():
     try:
         if not client.bucket_exists(bucket):
             client.make_bucket(bucket)
-            # Allow public download policy for media
-            policy = {
-                "Version": "2012-10-17",
-                "Statement": [
-                    {
-                        "Effect": "Allow",
-                        "Principal": {"AWS": ["*"]},
-                        "Action": ["s3:GetBucketLocation", "s3:ListBucket"],
-                        "Resource": [f"arn:aws:s3:::{bucket}"]
-                    },
-                    {
-                        "Effect": "Allow",
-                        "Principal": {"AWS": ["*"]},
-                        "Action": ["s3:GetObject"],
-                        "Resource": [f"arn:aws:s3:::{bucket}/*"]
-                    }
-                ]
-            }
-            client.set_bucket_policy(bucket, json.dumps(policy))
-            print(f"MinIO bucket '{bucket}' initialized with public read policy.")
-        else:
-            print(f"MinIO bucket '{bucket}' exists.")
+        
+        # Security hardening: Allow public download of media objects (avatars/chat),
+        # but STRICTLY FORBID s3:ListBucket so anonymous users cannot enumerate or scrape user files.
+        policy = {
+            "Version": "2012-10-17",
+            "Statement": [
+                {
+                    "Effect": "Allow",
+                    "Principal": {"AWS": ["*"]},
+                    "Action": ["s3:GetObject"],
+                    "Resource": [
+                        f"arn:aws:s3:::{bucket}/avatars/*",
+                        f"arn:aws:s3:::{bucket}/chat/*"
+                    ]
+                }
+            ]
+        }
+        client.set_bucket_policy(bucket, json.dumps(policy))
+        print(f"MinIO bucket '{bucket}' secured with strict object-only read policy.")
     except Exception as e:
         print(f"MinIO initialization warning: {e}")
 
@@ -57,11 +55,10 @@ def upload_file_to_minio(file_data, file_name, content_type, folder="chat"):
     client = get_minio_client()
     bucket = Config.MINIO_BUCKET
     
-    file_ext = os.path.splitext(file_name)[1]
+    file_ext = os.path.splitext(file_name)[1].lower()
     unique_name = f"{folder}/{uuid.uuid4().hex}{file_ext}"
     
     file_size = len(file_data)
-    from io import BytesIO
     data_stream = BytesIO(file_data)
     
     client.put_object(
@@ -72,7 +69,6 @@ def upload_file_to_minio(file_data, file_name, content_type, folder="chat"):
         content_type=content_type or "application/octet-stream"
     )
     
-    # Public URL
     url = f"{Config.MINIO_PUBLIC_URL}/{bucket}/{unique_name}"
     return unique_name, url, file_size
 

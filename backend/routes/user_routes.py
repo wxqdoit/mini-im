@@ -1,7 +1,8 @@
 from flask import Blueprint, request, jsonify, g
 from db import get_db
 from auth import token_required
-from redis_client import set_user_online, get_user_status, is_user_online, publish_event
+from redis_client import set_user_online, get_users_presence_batch, publish_event, cache_user_profile
+from rate_limiter import rate_limit
 
 user_bp = Blueprint("users", __name__, url_prefix="/api/users")
 
@@ -48,6 +49,9 @@ def update_profile():
     if updated_user.get("updated_at"):
         updated_user["updated_at"] = updated_user["updated_at"].isoformat()
 
+    # Synchronize Redis cache immediately
+    cache_user_profile(updated_user)
+
     # Broadcast status / profile update
     publish_event("mini_im:user_profile_updated", {"user": updated_user})
     if status is not None:
@@ -67,6 +71,7 @@ def update_profile():
 
 @user_bp.route("/search", methods=["GET"])
 @token_required
+@rate_limit("search_users", limit=30, window_seconds=60, by_user=True)
 def search_users():
     query = request.args.get("q", "").strip()
     current_user_id = g.current_user["id"]
@@ -87,8 +92,13 @@ def search_users():
         cur.execute(sql, (current_user_id, current_user_id, current_user_id, search_pattern, search_pattern))
         users = [dict(u) for u in cur.fetchall()]
 
+    # Batch presence check
+    user_ids = [u["id"] for u in users]
+    presence_map = get_users_presence_batch(user_ids)
+
     for u in users:
-        u["is_online"] = is_user_online(u["id"])
-        u["status"] = get_user_status(u["id"])
+        p = presence_map.get(u["id"], {"is_online": False, "status": "offline"})
+        u["is_online"] = p["is_online"]
+        u["status"] = p["status"]
 
     return jsonify({"users": users})

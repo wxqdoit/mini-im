@@ -23,9 +23,11 @@ sys.stderr.flush()
 with open(os.devnull, 'r') as devnull:
     os.dup2(devnull.fileno(), sys.stdin.fileno())
 
-log_file = open("server.log", "a+")
+log_file = open("server.log", "a+", buffering=1)
 os.dup2(log_file.fileno(), sys.stdout.fileno())
 os.dup2(log_file.fileno(), sys.stderr.fileno())
 
-# Execute python app.py
-os.execv(sys.executable, [sys.executable, "app.py"])
+os.environ["PYTHONUNBUFFERED"] = "1"
+
+# Execute python -u app.py
+os.execv(sys.executable, [sys.executable, "-u", "app.py"])

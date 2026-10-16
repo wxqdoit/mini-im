@@ -9,9 +9,11 @@ from config import Config
 from db import get_db
 from redis_client import (
     get_redis_client, set_user_online, set_user_offline,
-    refresh_user_heartbeat, publish_event, get_user_status
+    refresh_user_heartbeat, publish_event, get_user_status,
+    get_cached_group_members, cache_group_members
 )
 from kafka_service import send_to_kafka
+from rate_limiter import check_rate_limit
 
 sock = Sock()
 
@@ -59,9 +61,13 @@ def _redis_listener_loop():
                 _send_to_group(group_id, data)
                 continue
 
-            # 3. Global broadcast events (profile updates, status changes)
+            # 3. Targeted presence & profile update: push only to friends to eliminate O(N^2) broadcast storms
             if channel in ["mini_im:user_profile_updated", "mini_im:presence"]:
-                _broadcast_all(data)
+                user_id = data.get("data", {}).get("user_id") or data.get("user", {}).get("id")
+                if user_id:
+                    _notify_friends(user_id, data)
+                else:
+                    _broadcast_all(data)
                 continue
 
         except Exception as e:
@@ -84,20 +90,34 @@ def _send_to_user(user_id, data):
             for dws in dead_sockets:
                 active_connections[user_id].discard(dws)
 
-def _send_to_group(group_id, data):
-    member_ids = []
+def _get_group_members_fast(group_id: int):
+    """
+    Cached group member retrieval. Checks Redis first; falls back to DB on cache miss.
+    """
+    members = get_cached_group_members(group_id)
+    if members is not None:
+        return members
+    
+    # Query DB and cache in Redis
     try:
         with get_db() as cur:
             cur.execute("SELECT user_id FROM group_members WHERE group_id = %s", (group_id,))
             member_ids = [row["user_id"] for row in cur.fetchall()]
+        cache_group_members(group_id, member_ids)
+        return set(member_ids)
     except Exception as e:
         print(f"Error fetching group members for group {group_id}: {e}")
-        return
+        return set()
 
+def _send_to_group(group_id, data):
+    member_ids = _get_group_members_fast(group_id)
     payload_str = json.dumps(data, default=str)
+    
     for uid in member_ids:
         with connections_lock:
             sockets = list(active_connections.get(uid, set()))
+        if not sockets:
+            continue
         dead_sockets = []
         for ws in sockets:
             try:
@@ -108,6 +128,22 @@ def _send_to_group(group_id, data):
             with connections_lock:
                 for dws in dead_sockets:
                     active_connections[uid].discard(dws)
+
+def _notify_friends(user_id, data):
+    """
+    Targeted fan-out: only notify friends of status/profile updates rather than full-world broadcast.
+    """
+    friend_ids = []
+    try:
+        with get_db() as cur:
+            cur.execute("SELECT friend_id FROM friendships WHERE user_id = %s", (user_id,))
+            friend_ids = [row["friend_id"] for row in cur.fetchall()]
+    except Exception as e:
+        print(f"Error fetching friends for presence notification: {e}")
+        return
+
+    for fid in friend_ids:
+        _send_to_user(fid, data)
 
 def _broadcast_all(data):
     payload_str = json.dumps(data, default=str)
@@ -203,11 +239,8 @@ def handle_websocket(ws):
 
     try:
         while True:
-            # Receive with 35s timeout: clients ping every 15-20s.
-            # If no ping/message is received within 35s, cleanly terminate zombie session.
             raw_msg = ws.receive(timeout=35)
             if raw_msg is None:
-                # Timed out or connection closed
                 break
             
             try:
@@ -228,6 +261,15 @@ def handle_websocket(ws):
 
             # Chat message sent via WebSocket
             if msg_type == "chat_message":
+                # Rate limit: max 25 msgs per 5s per user
+                rl_key = f"mini_im:ratelimit:ws_chat:{user_id}"
+                if not check_rate_limit(rl_key, limit=25, window_seconds=5):
+                    try:
+                        ws.send(json.dumps({"error": "Rate limit exceeded. Please slow down."}))
+                    except Exception:
+                        break
+                    continue
+
                 conv_type = msg_data.get("conversation_type")
                 recipient_id = msg_data.get("recipient_id")
                 content = msg_data.get("content", "")
@@ -241,11 +283,22 @@ def handle_websocket(ws):
                 encrypted_key_bundle = msg_data.get("encrypted_key_bundle", None)
 
                 if conv_type and recipient_id:
+                    recipient_id = int(recipient_id)
+                    # Security check: group membership verification
+                    if conv_type == "group":
+                        members = _get_group_members_fast(recipient_id)
+                        if user_id not in members:
+                            try:
+                                ws.send(json.dumps({"error": "Forbidden: You are not a member of this group"}))
+                            except Exception:
+                                break
+                            continue
+
                     kafka_payload = {
                         "event_type": "chat_message",
                         "conversation_type": conv_type,
                         "sender_id": user_id,
-                        "recipient_id": int(recipient_id),
+                        "recipient_id": recipient_id,
                         "msg_type": m_type,
                         "content": content,
                         "media_url": media_url,

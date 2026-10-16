@@ -4,14 +4,21 @@ from psycopg2.extras import RealDictCursor
 from contextlib import contextmanager
 from config import Config
 
+# Cooperatively patch psycopg2 for gevent if gevent is running
+try:
+    from psycogreen.gevent import patch_psycopg
+    patch_psycopg()
+except ImportError:
+    pass
+
 connection_pool = None
 
 def init_db_pool():
     global connection_pool
     if connection_pool is None:
-        connection_pool = psycopg2.pool.SimpleConnectionPool(
-            minconn=2,
-            maxconn=20,
+        connection_pool = psycopg2.pool.ThreadedConnectionPool(
+            minconn=Config.PG_MIN_CONN,
+            maxconn=Config.PG_MAX_CONN,
             host=Config.PG_HOST,
             port=Config.PG_PORT,
             dbname=Config.PG_DB,
@@ -23,7 +30,16 @@ def init_db_pool():
 def get_db():
     if connection_pool is None:
         init_db_pool()
-    conn = connection_pool.getconn()
+    conn = None
+    import time
+    for attempt in range(5):
+        try:
+            conn = connection_pool.getconn()
+            break
+        except Exception:
+            time.sleep(0.02 * (attempt + 1))
+    if conn is None:
+        conn = connection_pool.getconn()
     try:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
             yield cur
@@ -32,7 +48,8 @@ def get_db():
         conn.rollback()
         raise
     finally:
-        connection_pool.putconn(conn)
+        if conn is not None:
+            connection_pool.putconn(conn)
 
 def init_tables():
     create_schema_sql = """
@@ -109,7 +126,16 @@ def init_tables():
     CREATE INDEX IF NOT EXISTS idx_friendships_user 
     ON friendships(user_id);
 
-    
+    CREATE INDEX IF NOT EXISTS idx_group_members_group 
+    ON group_members(group_id);
+
+    CREATE INDEX IF NOT EXISTS idx_group_members_user 
+    ON group_members(user_id);
+
+    CREATE INDEX IF NOT EXISTS idx_messages_unread 
+    ON messages(recipient_id, conversation_type, is_read)
+    WHERE is_read = FALSE;
+
     CREATE TABLE IF NOT EXISTS user_keys (
         id SERIAL PRIMARY KEY,
         user_id INT NOT NULL REFERENCES users(id) ON DELETE CASCADE UNIQUE,
@@ -134,10 +160,7 @@ def init_tables():
     ALTER TABLE messages ADD COLUMN IF NOT EXISTS iv VARCHAR(64) DEFAULT '';
     ALTER TABLE messages ADD COLUMN IF NOT EXISTS ephemeral_key TEXT DEFAULT '';
     ALTER TABLE messages ADD COLUMN IF NOT EXISTS encrypted_key_bundle JSONB DEFAULT NULL;
-
-    CREATE INDEX IF NOT EXISTS idx_group_members_group 
-    ON group_members(group_id);
     """
     with get_db() as cur:
         cur.execute(create_schema_sql)
-    print("Database tables initialized successfully!")
+    print("Database tables & indexes initialized successfully!")

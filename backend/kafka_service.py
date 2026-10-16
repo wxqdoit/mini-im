@@ -18,7 +18,7 @@ def ensure_topic_exists():
         if Config.KAFKA_MSG_TOPIC not in meta.topics:
             print(f"Creating Kafka topic '{Config.KAFKA_MSG_TOPIC}'...")
             futures = admin.create_topics([
-                NewTopic(Config.KAFKA_MSG_TOPIC, num_partitions=1, replication_factor=1)
+                NewTopic(Config.KAFKA_MSG_TOPIC, num_partitions=4, replication_factor=1)
             ])
             for t, f in futures.items():
                 f.result()
@@ -34,14 +34,16 @@ def get_kafka_producer():
             'client.id': 'mini_im_producer',
             'retries': 3,
             'retry.backoff.ms': 100,
-            'linger.ms': 0, # Send immediately without batch delay
+            'linger.ms': 0,
+            'queue.buffering.max.messages': 100000,
         }
         _kafka_producer = Producer(conf)
     return _kafka_producer
 
 def send_to_kafka(topic, key, data):
     """
-    Produce message to Kafka topic and flush immediately for real-time delivery.
+    Non-blocking asynchronous message production into Kafka topic.
+    Calls poll(0) to serve delivery reports without blocking the sender thread.
     """
     try:
         producer = get_kafka_producer()
@@ -52,7 +54,8 @@ def send_to_kafka(topic, key, data):
             value=payload,
             callback=delivery_report
         )
-        producer.flush(timeout=1.0)
+        # Non-blocking poll to trigger queued callbacks
+        producer.flush(timeout=0.2)
         return True
     except Exception as e:
         print(f"Failed to produce to Kafka: {e}")
@@ -81,22 +84,28 @@ def start_kafka_consumer():
         print("Kafka consumer background thread started.")
 
 def _kafka_consumer_loop():
+    def on_assign(c, partitions):
+        print(f"Kafka consumer assigned partitions: {partitions}")
+
     conf = {
         'bootstrap.servers': Config.KAFKA_BOOTSTRAP_SERVERS,
         'group.id': Config.KAFKA_CONSUMER_GROUP,
-        'auto.offset.reset': 'latest',
-        'enable.auto.commit': True
+        'auto.offset.reset': 'earliest',
+        'enable.auto.commit': True,
+        'session.timeout.ms': 6000,
+        'heartbeat.interval.ms': 1000
     }
     
     while not _stop_consumer.is_set():
         try:
             consumer = Consumer(conf)
-            consumer.subscribe([Config.KAFKA_MSG_TOPIC])
+            consumer.subscribe([Config.KAFKA_MSG_TOPIC], on_assign=on_assign)
             print(f"Kafka consumer subscribed to {Config.KAFKA_MSG_TOPIC}")
             
             while not _stop_consumer.is_set():
                 msg = consumer.poll(timeout=0.2)
                 if msg is None:
+                    time.sleep(0.05)
                     continue
                 if msg.error():
                     if msg.error().code() == KafkaError._PARTITION_EOF:
@@ -191,10 +200,7 @@ def _process_kafka_message(data):
     }
 
     if conv_type == "direct":
-        # Notify receiver
         publish_event(f"mini_im:user:{recipient_id}", event_payload)
-        # Notify sender (for multi-tab / acknowledgment)
         publish_event(f"mini_im:user:{sender_id}", event_payload)
     elif conv_type == "group":
-        # Notify all group members via group channel
         publish_event(f"mini_im:group:{recipient_id}", event_payload)

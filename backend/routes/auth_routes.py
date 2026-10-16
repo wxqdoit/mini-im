@@ -1,11 +1,13 @@
 from flask import Blueprint, request, jsonify, g
 from db import get_db
 from auth import hash_password, verify_password, generate_token, token_required
-from redis_client import get_user_status
+from redis_client import get_user_status, invalidate_user_cache, cache_user_profile
+from rate_limiter import rate_limit
 
 auth_bp = Blueprint("auth", __name__, url_prefix="/api/auth")
 
 @auth_bp.route("/register", methods=["POST"])
+@rate_limit("register", limit=10, window_seconds=60)
 def register():
     data = request.get_json() or {}
     username = data.get("username", "").strip()
@@ -34,9 +36,10 @@ def register():
             """,
             (username, pwd_hash, nickname, avatar, bio)
         )
-        user = cur.fetchone()
+        user = dict(cur.fetchone())
 
     token = generate_token(user["id"])
+    cache_user_profile(user)
     return jsonify({
         "message": "Registration successful",
         "token": token,
@@ -44,6 +47,7 @@ def register():
     }), 201
 
 @auth_bp.route("/login", methods=["POST"])
+@rate_limit("login", limit=15, window_seconds=60)
 def login():
     data = request.get_json() or {}
     username = data.get("username", "").strip()
@@ -68,6 +72,7 @@ def login():
         "bio": user["bio"],
         "status": get_user_status(user["id"])
     }
+    cache_user_profile(user_info)
 
     return jsonify({
         "message": "Login successful",
@@ -81,6 +86,7 @@ def logout():
     user_id = g.current_user["id"]
     from websocket_server import close_user_connections
     close_user_connections(user_id)
+    invalidate_user_cache(user_id)
     return jsonify({"message": "Logged out successfully"})
 
 @auth_bp.route("/me", methods=["GET"])

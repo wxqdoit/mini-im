@@ -106,7 +106,6 @@ def get_group_keys(group_id):
         return jsonify({"has_key": False}), 200
 
     encrypted_keys = key_row["encrypted_keys"]
-    # Provide the user's specific encrypted payload
     user_key_data = encrypted_keys.get(str(user_id)) if isinstance(encrypted_keys, dict) else None
 
     return jsonify({
@@ -129,11 +128,14 @@ def set_group_keys(group_id):
         return jsonify({"error": "encrypted_keys object required"}), 400
 
     with get_db() as cur:
-        # Check membership
+        # Check membership and role: Only owner or admin can update group keys
         cur.execute("SELECT role FROM group_members WHERE group_id = %s AND user_id = %s", (group_id, user_id))
         mem = cur.fetchone()
         if not mem:
             return jsonify({"error": "You are not a member of this group"}), 403
+        
+        if mem["role"] not in ["owner", "admin"]:
+            return jsonify({"error": "Forbidden: Only group owner or admin can update group keys"}), 403
 
         cur.execute("""
             INSERT INTO group_e2ee_keys (group_id, key_version, encrypted_keys, created_by)

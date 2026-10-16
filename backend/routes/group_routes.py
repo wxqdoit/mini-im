@@ -1,18 +1,22 @@
 from flask import Blueprint, request, jsonify, g
 from db import get_db
 from auth import token_required
-from redis_client import is_user_online, get_user_status, publish_event
+from redis_client import (
+    publish_event, get_users_presence_batch,
+    add_group_member_cache, remove_group_member_cache,
+    invalidate_group_members_cache
+)
 
 group_bp = Blueprint("groups", __name__, url_prefix="/api/groups")
 
 @group_bp.route("", methods=["POST"])
 @token_required
 def create_group():
-    user_id = g.current_user["id"]
+    owner_id = g.current_user["id"]
     data = request.get_json() or {}
     name = data.get("name", "").strip()
-    description = data.get("description", "").strip()
     avatar = data.get("avatar", "")
+    description = data.get("description", "").strip()
 
     if not name:
         return jsonify({"error": "Group name is required"}), 400
@@ -20,37 +24,37 @@ def create_group():
     with get_db() as cur:
         # Create group
         cur.execute("""
-            INSERT INTO groups (name, description, avatar, owner_id)
+            INSERT INTO groups (name, avatar, description, owner_id)
             VALUES (%s, %s, %s, %s)
-            RETURNING id, name, description, avatar, owner_id, created_at;
-        """, (name, description, avatar, user_id))
-        new_group = cur.fetchone()
-        group_id = new_group["id"]
+            RETURNING id, name, avatar, description, owner_id, created_at;
+        """, (name, avatar, description, owner_id))
+        group = dict(cur.fetchone())
 
         # Add creator as owner member
         cur.execute("""
             INSERT INTO group_members (group_id, user_id, role)
             VALUES (%s, %s, 'owner');
-        """, (group_id, user_id))
+        """, (group["id"], owner_id))
+
+    add_group_member_cache(group["id"], owner_id)
 
     return jsonify({
         "message": "Group created successfully",
-        "group": new_group
+        "group": group
     }), 201
 
 @group_bp.route("", methods=["GET"])
 @token_required
-def get_my_groups():
+def get_user_groups():
     user_id = g.current_user["id"]
     with get_db() as cur:
         sql = """
-        SELECT g.id, g.name, g.avatar, g.description, g.owner_id, g.created_at,
-               gm.role,
+        SELECT g.id, g.name, g.avatar, g.description, g.owner_id, gm.role, gm.joined_at,
                (SELECT COUNT(*) FROM group_members WHERE group_id = g.id) as member_count
         FROM groups g
         JOIN group_members gm ON g.id = gm.group_id
         WHERE gm.user_id = %s
-        ORDER BY g.created_at DESC;
+        ORDER BY gm.joined_at DESC;
         """
         cur.execute(sql, (user_id,))
         groups = cur.fetchall()
@@ -62,44 +66,23 @@ def get_my_groups():
 def search_groups():
     query = request.args.get("q", "").strip()
     user_id = g.current_user["id"]
-    
+
     if not query:
         return jsonify({"groups": []})
 
     with get_db() as cur:
         sql = """
-        SELECT g.id, g.name, g.avatar, g.description, g.owner_id, g.created_at,
+        SELECT g.id, g.name, g.avatar, g.description, g.owner_id,
                (SELECT COUNT(*) FROM group_members WHERE group_id = g.id) as member_count,
                EXISTS(SELECT 1 FROM group_members WHERE group_id = g.id AND user_id = %s) as is_member
         FROM groups g
-        WHERE g.name ILIKE %s OR g.description ILIKE %s
+        WHERE g.name ILIKE %s
         LIMIT 20;
         """
-        pattern = f"%{query}%"
-        cur.execute(sql, (user_id, pattern, pattern))
+        cur.execute(sql, (user_id, f"%{query}%"))
         groups = cur.fetchall()
 
     return jsonify({"groups": groups})
-
-@group_bp.route("/<int:group_id>", methods=["GET"])
-@token_required
-def get_group_detail(group_id):
-    user_id = g.current_user["id"]
-    with get_db() as cur:
-        cur.execute("""
-            SELECT g.id, g.name, g.avatar, g.description, g.owner_id, g.created_at,
-                   (SELECT COUNT(*) FROM group_members WHERE group_id = g.id) as member_count,
-                   EXISTS(SELECT 1 FROM group_members WHERE group_id = g.id AND user_id = %s) as is_member,
-                   (SELECT role FROM group_members WHERE group_id = g.id AND user_id = %s) as my_role
-            FROM groups g
-            WHERE g.id = %s;
-        """, (user_id, user_id, group_id))
-        group = cur.fetchone()
-
-        if not group:
-            return jsonify({"error": "Group not found"}), 404
-
-    return jsonify({"group": group})
 
 @group_bp.route("/<int:group_id>/join", methods=["POST"])
 @token_required
@@ -111,7 +94,7 @@ def join_group(group_id):
         if not group:
             return jsonify({"error": "Group not found"}), 404
 
-        cur.execute("SELECT 1 FROM group_members WHERE group_id = %s AND user_id = %s", (group_id, user_id))
+        cur.execute("SELECT id FROM group_members WHERE group_id = %s AND user_id = %s", (group_id, user_id))
         if cur.fetchone():
             return jsonify({"error": "Already a member of this group"}), 400
 
@@ -119,6 +102,8 @@ def join_group(group_id):
             INSERT INTO group_members (group_id, user_id, role)
             VALUES (%s, %s, 'member');
         """, (group_id, user_id))
+
+    add_group_member_cache(group_id, user_id)
 
     # Notify group channel
     publish_event(f"mini_im:group:{group_id}", {
@@ -129,13 +114,18 @@ def join_group(group_id):
         }
     })
 
-    group_name = group["name"]
-    return jsonify({"message": f"Successfully joined {group_name}"})
+    return jsonify({"message": f"Successfully joined {group['name']}"})
 
 @group_bp.route("/<int:group_id>/members", methods=["GET"])
 @token_required
 def get_group_members(group_id):
+    user_id = g.current_user["id"]
     with get_db() as cur:
+        # Authorization check: verify user is a member of the group
+        cur.execute("SELECT 1 FROM group_members WHERE group_id = %s AND user_id = %s", (group_id, user_id))
+        if not cur.fetchone():
+            return jsonify({"error": "Forbidden: You are not a member of this group"}), 403
+
         sql = """
         SELECT gm.id as membership_id, gm.role, gm.joined_at,
                u.id as user_id, u.username, u.nickname, u.avatar, u.bio
@@ -153,18 +143,22 @@ def get_group_members(group_id):
         cur.execute(sql, (group_id,))
         members = cur.fetchall()
 
+    # Batch presence retrieval in ONE Redis pipeline round trip
+    uids = [m["user_id"] for m in members]
+    presence_map = get_users_presence_batch(uids)
+
     for m in members:
-        m["is_online"] = is_user_online(m["user_id"])
-        m["status"] = get_user_status(m["user_id"])
+        p = presence_map.get(m["user_id"], {"is_online": False, "status": "offline"})
+        m["is_online"] = p["is_online"]
+        m["status"] = p["status"]
 
     return jsonify({"members": members})
 
 @group_bp.route("/<int:group_id>/invite", methods=["POST"])
 @token_required
 def invite_to_group(group_id):
-    inviter_id = g.current_user["id"]
     data = request.get_json() or {}
-    user_ids = data.get("user_ids", [])  # list of user IDs
+    user_ids = data.get("user_ids", [])
 
     if not user_ids:
         return jsonify({"error": "user_ids list is required"}), 400
@@ -185,8 +179,8 @@ def invite_to_group(group_id):
             res = cur.fetchone()
             if res:
                 added_users.append(uid)
+                add_group_member_cache(group_id, uid)
 
-    # Publish notification to group
     if added_users:
         publish_event(f"mini_im:group:{group_id}", {
             "event": "members_invited",
@@ -216,9 +210,9 @@ def leave_group(group_id):
 
         # Remove from members
         cur.execute("DELETE FROM group_members WHERE group_id = %s AND user_id = %s", (group_id, user_id))
+        remove_group_member_cache(group_id, user_id)
 
         if is_owner:
-            # Pick next member to be owner, or delete group if empty
             cur.execute("SELECT user_id FROM group_members WHERE group_id = %s ORDER BY joined_at ASC LIMIT 1", (group_id,))
             next_owner = cur.fetchone()
             if next_owner:
@@ -226,6 +220,7 @@ def leave_group(group_id):
                 cur.execute("UPDATE group_members SET role = 'owner' WHERE group_id = %s AND user_id = %s", (group_id, next_owner["user_id"]))
             else:
                 cur.execute("DELETE FROM groups WHERE id = %s", (group_id,))
+                invalidate_group_members_cache(group_id)
 
     publish_event(f"mini_im:group:{group_id}", {
         "event": "member_left",
@@ -251,6 +246,7 @@ def disband_group(group_id):
             return jsonify({"error": "Only group owner can disband the group"}), 403
 
         cur.execute("DELETE FROM groups WHERE id = %s", (group_id,))
+        invalidate_group_members_cache(group_id)
 
     publish_event(f"mini_im:group:{group_id}", {
         "event": "group_disbanded",

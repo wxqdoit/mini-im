@@ -4,12 +4,14 @@ from db import get_db
 from auth import token_required
 from config import Config
 from kafka_service import send_to_kafka
-from redis_client import is_user_online, get_user_status
+from redis_client import get_users_presence_batch
+from rate_limiter import rate_limit
 
 message_bp = Blueprint("messages", __name__, url_prefix="/api/messages")
 
 @message_bp.route("/send", methods=["POST"])
 @token_required
+@rate_limit("send_msg", limit=30, window_seconds=5, by_user=True)
 def send_message():
     sender_id = g.current_user["id"]
     data = request.get_json() or {}
@@ -29,6 +31,15 @@ def send_message():
     if not conv_type or not recipient_id:
         return jsonify({"error": "conversation_type and recipient_id are required"}), 400
 
+    recipient_id = int(recipient_id)
+
+    # Security check: group membership verification
+    if conv_type == "group":
+        with get_db() as cur:
+            cur.execute("SELECT 1 FROM group_members WHERE group_id = %s AND user_id = %s", (recipient_id, sender_id))
+            if not cur.fetchone():
+                return jsonify({"error": "Forbidden: You are not a member of this group"}), 403
+
     if msg_type == "text" and not content:
         return jsonify({"error": "Content cannot be empty"}), 400
 
@@ -39,7 +50,7 @@ def send_message():
         "event_type": "chat_message",
         "conversation_type": conv_type,
         "sender_id": sender_id,
-        "recipient_id": int(recipient_id),
+        "recipient_id": recipient_id,
         "msg_type": msg_type,
         "content": content,
         "media_url": media_url,
@@ -73,43 +84,48 @@ def get_message_history():
     if not conv_type or not target_id:
         return jsonify({"error": "type and target_id are required"}), 400
 
-    params = []
-    where_clauses = ["m.conversation_type = %s"]
-    params.append(conv_type)
-
-    if conv_type == "direct":
-        where_clauses.append("((m.sender_id = %s AND m.recipient_id = %s) OR (m.sender_id = %s AND m.recipient_id = %s))")
-        params.extend([current_user_id, target_id, target_id, current_user_id])
-    elif conv_type == "group":
-        where_clauses.append("m.recipient_id = %s")
-        params.append(target_id)
-    else:
-        return jsonify({"error": "Invalid conversation type"}), 400
-
-    if before_id:
-        where_clauses.append("m.id < %s")
-        params.append(before_id)
-
-    params.append(limit)
-
-    sql = f"""
-    SELECT m.id, m.conversation_type, m.sender_id, m.recipient_id,
-           m.msg_type, m.content, m.media_url, m.file_name, m.file_size,
-           m.is_read, m.is_encrypted, m.iv, m.ephemeral_key, m.encrypted_key_bundle, m.created_at,
-           json_build_object(
-               'id', u.id,
-               'username', u.username,
-               'nickname', u.nickname,
-               'avatar', u.avatar
-           ) as sender
-    FROM messages m
-    JOIN users u ON m.sender_id = u.id
-    WHERE {' AND '.join(where_clauses)}
-    ORDER BY m.id DESC
-    LIMIT %s;
-    """
-
     with get_db() as cur:
+        # Security check: group membership authorization (prevents IDOR)
+        if conv_type == "group":
+            cur.execute("SELECT 1 FROM group_members WHERE group_id = %s AND user_id = %s", (target_id, current_user_id))
+            if not cur.fetchone():
+                return jsonify({"error": "Forbidden: You are not a member of this group"}), 403
+
+        params = []
+        where_clauses = ["m.conversation_type = %s"]
+        params.append(conv_type)
+
+        if conv_type == "direct":
+            where_clauses.append("((m.sender_id = %s AND m.recipient_id = %s) OR (m.sender_id = %s AND m.recipient_id = %s))")
+            params.extend([current_user_id, target_id, target_id, current_user_id])
+        elif conv_type == "group":
+            where_clauses.append("m.recipient_id = %s")
+            params.append(target_id)
+        else:
+            return jsonify({"error": "Invalid conversation type"}), 400
+
+        if before_id:
+            where_clauses.append("m.id < %s")
+            params.append(before_id)
+
+        params.append(limit)
+
+        sql = f"""
+        SELECT m.id, m.conversation_type, m.sender_id, m.recipient_id,
+               m.msg_type, m.content, m.media_url, m.file_name, m.file_size,
+               m.is_read, m.is_encrypted, m.iv, m.ephemeral_key, m.encrypted_key_bundle, m.created_at,
+               json_build_object(
+                   'id', u.id,
+                   'username', u.username,
+                   'nickname', u.nickname,
+                   'avatar', u.avatar
+               ) as sender
+        FROM messages m
+        JOIN users u ON m.sender_id = u.id
+        WHERE {' AND '.join(where_clauses)}
+        ORDER BY m.id DESC
+        LIMIT %s;
+        """
         cur.execute(sql, tuple(params))
         messages = cur.fetchall()
 
@@ -155,8 +171,20 @@ def get_conversations():
         cur.execute(sql_friends, (user_id,))
         friends = cur.fetchall()
 
+        # Batch fetch unread counts in ONE query instead of N loop queries
+        cur.execute("""
+            SELECT sender_id, COUNT(*) as unread
+            FROM messages
+            WHERE conversation_type = 'direct' AND recipient_id = %s AND is_read = FALSE
+            GROUP BY sender_id;
+        """, (user_id,))
+        unread_map = {row["sender_id"]: row["unread"] for row in cur.fetchall()}
+
+        # Batch fetch online statuses from Redis in ONE pipeline round-trip
+        friend_ids = [f["id"] for f in friends]
+        presence_map = get_users_presence_batch(friend_ids)
+
         for f in friends:
-            # Get latest message
             cur.execute("""
                 SELECT id, msg_type, content, media_url, created_at, sender_id, is_encrypted
                 FROM messages
@@ -165,15 +193,6 @@ def get_conversations():
                 ORDER BY id DESC LIMIT 1;
             """, (user_id, f["id"], f["id"], user_id))
             last_msg = cur.fetchone()
-
-            # Count unread messages
-            cur.execute("""
-                SELECT COUNT(*) as unread
-                FROM messages
-                WHERE conversation_type = 'direct'
-                  AND sender_id = %s AND recipient_id = %s AND is_read = FALSE;
-            """, (f["id"], user_id))
-            unread_res = cur.fetchone()
 
             last_preview = ""
             last_time = None
@@ -188,6 +207,8 @@ def get_conversations():
                 else:
                     last_preview = "[文件]"
 
+            p_info = presence_map.get(f["id"], {"is_online": False, "status": "offline"})
+
             conversations.append({
                 "conversation_id": f"direct_{f['id']}",
                 "type": "direct",
@@ -195,11 +216,11 @@ def get_conversations():
                 "name": f["nickname"],
                 "avatar": f["avatar"],
                 "bio": f["bio"],
-                "is_online": is_user_online(f["id"]),
-                "status": get_user_status(f["id"]),
+                "is_online": p_info["is_online"],
+                "status": p_info["status"],
                 "last_message": last_preview,
                 "last_time": last_time,
-                "unread_count": unread_res["unread"] if unread_res else 0
+                "unread_count": unread_map.get(f["id"], 0)
             })
 
         # 2. Group conversations
@@ -249,7 +270,7 @@ def get_conversations():
                 "unread_count": 0
             })
 
-    # Sort conversations by last message time (most recent first)
+    # Sort conversations by latest message time
     conversations.sort(key=lambda c: c["last_time"] or "", reverse=True)
 
     return jsonify({"conversations": conversations})

@@ -5,9 +5,9 @@ from flask import request, jsonify, g
 from werkzeug.security import generate_password_hash, check_password_hash
 from config import Config
 from db import get_db
+from redis_client import get_cached_user_profile, cache_user_profile
 
 def hash_password(password: str) -> str:
-    # Use pbkdf2:sha256 which is universal across all Python and SSL builds
     return generate_password_hash(password, method="pbkdf2:sha256")
 
 def verify_password(plain_password: str, hashed_password: str) -> bool:
@@ -27,11 +27,22 @@ def decode_token(token: str):
         user_id = payload.get("user_id")
         if not user_id:
             return None
+
+        # 1. Fast path: check Redis cache
+        cached_user = get_cached_user_profile(user_id)
+        if cached_user:
+            return cached_user
+
+        # 2. Slow path: fetch from DB and populate cache
         with get_db() as cur:
             cur.execute("SELECT id, username, nickname, avatar, bio, status FROM users WHERE id = %s", (user_id,))
             user = cur.fetchone()
-            return user
-    except Exception as e:
+            if user:
+                user_dict = dict(user)
+                cache_user_profile(user_dict)
+                return user_dict
+            return None
+    except Exception:
         return None
 
 def token_required(f):

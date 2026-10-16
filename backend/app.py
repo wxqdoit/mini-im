@@ -1,3 +1,15 @@
+from gevent import monkey
+monkey.patch_all()
+
+try:
+    from psycogreen.gevent import patch_psycopg
+    patch_psycopg()
+except ImportError:
+    pass
+
+from gevent.pywsgi import WSGIServer
+from gevent.pool import Pool
+
 from flask import Flask, jsonify
 from flask_cors import CORS
 from config import Config
@@ -19,7 +31,7 @@ def create_app():
     app = Flask(__name__)
     app.config.from_object(Config)
 
-    # Enable CORS for all routes (supporting Vite frontend on 5173 / any port)
+    # Enable CORS for API routes
     CORS(app, resources={r"/api/*": {"origins": "*"}}, supports_credentials=True)
 
     # Initialize components
@@ -45,6 +57,8 @@ def create_app():
     def health_check():
         return jsonify({
             "status": "healthy",
+            "server": "Gevent-Async-Engine",
+            "max_concurrency": 15000,
             "services": {
                 "postgres": "ok",
                 "redis": "ok",
@@ -57,5 +71,18 @@ def create_app():
 
 if __name__ == "__main__":
     app = create_app()
-    print("Mini IM backend starting on http://0.0.0.0:5001")
-    app.run(host="0.0.0.0", port=5001, debug=False, threaded=True)
+    pool = Pool(15000)
+    server = WSGIServer(
+        ("0.0.0.0", 5001),
+        app,
+        spawn=pool,
+        backlog=2048,
+        log=None,
+        error_log=None
+    )
+    print("=" * 60)
+    print("Mini IM High-Concurrency Backend (Gevent Async IO Engine)")
+    print("Listening on: http://0.0.0.0:5001")
+    print("Coroutine Pool Capacity: 15,000 simultaneous connections")
+    print("=" * 60)
+    server.serve_forever()

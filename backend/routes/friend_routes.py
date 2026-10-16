@@ -1,7 +1,8 @@
 from flask import Blueprint, request, jsonify, g
 from db import get_db
 from auth import token_required
-from redis_client import is_user_online, get_user_status, publish_event
+from redis_client import get_users_presence_batch, publish_event
+from rate_limiter import rate_limit
 
 friend_bp = Blueprint("friends", __name__, url_prefix="/api/friends")
 
@@ -20,14 +21,20 @@ def get_friends():
         cur.execute(sql, (user_id,))
         friends = cur.fetchall()
 
+    # Batch presence check via Redis pipeline
+    friend_ids = [f["id"] for f in friends]
+    presence_map = get_users_presence_batch(friend_ids)
+
     for f in friends:
-        f["is_online"] = is_user_online(f["id"])
-        f["status"] = get_user_status(f["id"])
+        p = presence_map.get(f["id"], {"is_online": False, "status": "offline"})
+        f["is_online"] = p["is_online"]
+        f["status"] = p["status"]
 
     return jsonify({"friends": friends})
 
 @friend_bp.route("/request", methods=["POST"])
 @token_required
+@rate_limit("friend_request", limit=20, window_seconds=60, by_user=True)
 def send_friend_request():
     sender_id = g.current_user["id"]
     data = request.get_json() or {}
